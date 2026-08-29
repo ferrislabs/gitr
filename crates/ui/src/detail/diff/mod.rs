@@ -22,9 +22,12 @@
 //! Selection comes back through `gpui-base`'s window-level participant system rather than
 //! from the editor. [`body`] is the element that joins it: it registers one participant and
 //! declares one run per cell on screen, left before right within a row, and only the code
-//! text becomes a run — the gutters and the marker are painted directly and never
-//! registered, which is what keeps line numbers and markers out of the clipboard. The rows
-//! scroll on both axes rather than soft-wrapping,
+//! text — or, on a file header, the path alone — becomes a run. Everything else a row draws
+//! is painted directly and never registered: a line's gutters and its `+`/`−` marker, and a
+//! header's disclosure chevron, status pastille, change bar and change count. That is what
+//! keeps line numbers, markers and a file's statistics out of the clipboard, and it is why
+//! copying a header yields a bare path. The rows scroll on both axes rather than
+//! soft-wrapping,
 //! matching GitHub. `restrict_scroll_to_axis` still earns its place here, but not for the
 //! reason it usually does: the container's `overflow_scroll()` puts both axes in
 //! `Overflow::Scroll`, and gpui's vertical-onto-horizontal remap (`div.rs:3220-3224`,
@@ -69,15 +72,18 @@
 //! because a cell is laid out against a column width that provably exceeds every cell's
 //! natural width — which is what keeps a row one line tall and `ROW_HEIGHT` true. That is
 //! affordable only because the text it measures is not rebuilt with it: [`DiffContent`]
-//! holds the rows and one [`gpui::SharedString`] per cell, derived by [`content`] when the
-//! patch, the view mode or the set of collapsed files changes and handed to the element
-//! behind an `Rc` thereafter. So
-//! after the first frame each cell is a hit in gpui's line-layout cache and the steady-state
-//! cost is a hash of bytes that are already there, with no allocation and no reshape.
+//! holds the rows, one [`gpui::SharedString`] per cell, and the total changes of the patch's
+//! largest file, derived by [`content`] when the patch, the view mode or the set of collapsed
+//! files changes and handed to the element behind an `Rc` thereafter. So after the first
+//! frame each cell is a hit in gpui's line-layout cache and the steady-state cost is a hash
+//! of bytes that are already there, with no allocation and no reshape. That last number is
+//! the scale every header's change bar is drawn against, and it belongs to the derivation for
+//! the same reason the strings do: a bar is a share of the widest file in the patch, so
+//! sizing one from the element would mean walking every file of the patch on every frame.
 //! Collapsing is applied in that same derivation — the body rows of a collapsed file are
 //! never emitted — so the element windows, paints and selects over a shorter list and knows
-//! nothing of collapsing beyond mapping a click to a row and drawing a disclosure marker in
-//! the header's own gutter, which keeps that marker out of every run and every copy.
+//! nothing of collapsing beyond mapping a click to a row and drawing a disclosure chevron at
+//! the header's own left edge, which keeps that chevron out of every run and every copy.
 //!
 //! Copying depends on a fact `gpui-base`'s own doc comment does not state. A participant's
 //! runs concatenate with no separator when `update_runs` projects them
@@ -124,7 +130,7 @@ use gpui_component::{
 use crate::diff_view_mode::DiffViewMode;
 
 use body::{ROW_HEIGHT, Rows, body, cell_strings};
-use model::rows;
+use model::{max_changes, rows};
 use split::split_rows;
 
 pub(super) type Collapsed = HashSet<usize>;
@@ -134,6 +140,7 @@ pub(super) type ToggleFile = Rc<dyn Fn(&usize, &mut Window, &mut App)>;
 pub(super) struct DiffContent {
     rows: Rows,
     strings: Vec<SharedString>,
+    max_changes: usize,
 }
 
 impl DiffContent {
@@ -152,7 +159,11 @@ pub(super) fn content(patch: &Patch, mode: DiffViewMode, collapsed: &Collapsed) 
         DiffViewMode::Split => Rows::Split(split_rows(patch, collapsed)),
     };
     let strings = cell_strings(&rows);
-    DiffContent { rows, strings }
+    DiffContent {
+        rows,
+        strings,
+        max_changes: max_changes(patch),
+    }
 }
 
 pub(super) fn render(

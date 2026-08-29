@@ -1,12 +1,13 @@
 use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
 
-use domain::LineOrigin;
+use domain::{FileStatus, LineOrigin};
 use gpui::{
-    App, Bounds, DispatchPhase, Element, ElementId, FlexDirection, GlobalElementId, Half as _,
-    HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    Length, MouseButton, MouseDownEvent, Pixels, Point, ScrollHandle, ShapedLine, SharedString,
-    Style, StyledText, TextAlign, TextLayout, TextStyle, Window, fill, point, px, relative, size,
+    App, Bounds, DispatchPhase, Element, ElementId, FlexDirection, FontWeight, GlobalElementId,
+    Half as _, HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
+    LayoutId, Length, MouseButton, MouseDownEvent, Pixels, Point, ScrollHandle, ShapedLine,
+    SharedString, Style, StyledText, TextAlign, TextLayout, TextStyle, Window, fill, point, px,
+    relative, size,
 };
 use gpui_base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
 use gpui_component::{ThemeColor, ThemeMode};
@@ -28,6 +29,22 @@ const SPLIT_CODE_LEFT: f32 = GUTTER_WIDTH + MARKER_WIDTH;
 const COLUMN_RULE_WIDTH: f32 = 1.;
 const TRAILING_SPACE: f32 = 16.;
 const UNMEASURED_ROWS: usize = 100;
+
+const HEADER_PADDING: f32 = 8.;
+const DISCLOSURE_WIDTH: f32 = 12.;
+const PASTILLE_SIZE: f32 = 8.;
+const PASTILLE_RADIUS: f32 = 2.;
+const PASTILLE_GAP: f32 = 8.;
+const PASTILLE_LEFT: f32 = HEADER_PADDING + DISCLOSURE_WIDTH;
+const PASTILLE_TOP: f32 = (ROW_HEIGHT - PASTILLE_SIZE) / 2.;
+const HEADER_TEXT_LEFT: f32 = PASTILLE_LEFT + PASTILLE_SIZE + PASTILLE_GAP;
+const BAR_WIDTH: f32 = 64.;
+const BAR_HEIGHT: f32 = 8.;
+const BAR_TOP: f32 = (ROW_HEIGHT - BAR_HEIGHT) / 2.;
+const BAR_MIN_SEGMENT: f32 = 2.;
+const BAR_MIN_WIDTH: f32 = 2. * BAR_MIN_SEGMENT;
+const BAR_GAP: f32 = 8.;
+const COUNT_WIDTH: f32 = 34.;
 
 pub(super) enum Rows {
     Unified(Vec<Row>),
@@ -57,6 +74,13 @@ impl Rows {
         match self {
             Rows::Unified(_) => CODE_LEFT,
             Rows::Split(_) => SPLIT_CODE_LEFT,
+        }
+    }
+
+    fn cell_left(&self, row: usize) -> f32 {
+        match self.full(row) {
+            Some(Row::FileHeader { .. }) => HEADER_TEXT_LEFT,
+            _ => self.code_left(),
         }
     }
 
@@ -162,13 +186,7 @@ fn cell_text(rows: &Rows, cell: usize) -> SharedString {
 
 fn row_text(row: &Row) -> SharedString {
     match row {
-        Row::FileHeader {
-            path,
-            status,
-            added,
-            deleted,
-            ..
-        } => header_line(path, status, *added, *deleted).into(),
+        Row::FileHeader { path, .. } => header_line(path).into(),
         Row::Separator => SharedString::default(),
         Row::Line { content, .. } => content.clone().into(),
         Row::Placeholder { message } => (*message).into(),
@@ -228,19 +246,55 @@ fn column_left(bounds: Bounds<Pixels>, columns: usize, column: usize) -> Pixels 
 fn bounds_for_cell(
     bounds: Bounds<Pixels>,
     columns: usize,
-    code_left: Pixels,
+    left: Pixels,
     cell: usize,
 ) -> Bounds<Pixels> {
     Bounds::new(
         point(
-            column_left(bounds, columns, cell % columns) + code_left,
+            column_left(bounds, columns, cell % columns) + left,
             bounds.origin.y + px((cell / columns) as f32 * ROW_HEIGHT),
         ),
         size(
-            (column_width(bounds, columns) - code_left).max(px(0.)),
+            (column_width(bounds, columns) - left).max(px(0.)),
             px(ROW_HEIGHT),
         ),
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Bar {
+    added: f32,
+    deleted: f32,
+}
+
+fn bar_widths(added: usize, deleted: usize, max_changes: usize) -> Option<Bar> {
+    let total = added + deleted;
+    if total == 0 || max_changes == 0 {
+        return None;
+    }
+    let width = (BAR_WIDTH * total as f32 / max_changes as f32).max(BAR_MIN_WIDTH);
+    let mut green = width * added as f32 / total as f32;
+    if added > 0 {
+        green = green.max(BAR_MIN_SEGMENT);
+    }
+    if deleted > 0 {
+        green = green.min(width - BAR_MIN_SEGMENT);
+    }
+    Some(Bar {
+        added: green,
+        deleted: width - green,
+    })
+}
+
+fn status_color(status: &FileStatus, theme: &ThemeColor) -> Hsla {
+    match status {
+        FileStatus::Added => theme.green,
+        FileStatus::Deleted => theme.red,
+        FileStatus::Modified => theme.blue,
+        FileStatus::Renamed { .. } | FileStatus::Copied { .. } | FileStatus::TypeChanged => {
+            theme.muted_foreground
+        }
+    }
 }
 
 fn selection_quad_bounds(
@@ -428,8 +482,23 @@ impl Pen {
     }
 
     fn shape(&self, text: SharedString, color: Hsla, window: &Window) -> ShapedLine {
+        self.weighted(text, color, self.style.font_weight, window)
+    }
+
+    fn bold(&self, text: SharedString, color: Hsla, window: &Window) -> ShapedLine {
+        self.weighted(text, color, FontWeight::BOLD, window)
+    }
+
+    fn weighted(
+        &self,
+        text: SharedString,
+        color: Hsla,
+        weight: FontWeight,
+        window: &Window,
+    ) -> ShapedLine {
         let mut run = self.style.to_run(text.len());
         run.color = color;
+        run.font.weight = weight;
         window
             .text_system()
             .shape_line(text, self.font_size, &[run], None)
@@ -475,10 +544,11 @@ impl DiffBody {
     }
 
     fn cell_bounds_at(&self, bounds: Bounds<Pixels>, cell: usize) -> Bounds<Pixels> {
+        let columns = self.rows().columns();
         bounds_for_cell(
             bounds,
-            self.rows().columns(),
-            px(self.rows().code_left()),
+            columns,
+            px(self.rows().cell_left(cell / columns)),
             cell,
         )
     }
@@ -626,15 +696,6 @@ impl DiffBody {
         let marker_left = left + px(self.rows().marker_left());
         let muted = self.theme.muted_foreground;
 
-        if let Some(header @ Row::FileHeader { collapsed, .. }) = self.rows().full(row) {
-            if column == 0 {
-                let color = row_foreground(header, &self.theme);
-                let line = pen.shape(disclosure(*collapsed).into(), color, window);
-                paint_line(&line, point(marker_left, top), window, cx);
-            }
-            return;
-        }
-
         let origin = match self.rows() {
             Rows::Unified(rows) => {
                 let Row::Line {
@@ -686,6 +747,80 @@ impl DiffBody {
         let marker_color = line_colors(origin, self.mode, &self.theme).foreground;
         let line = pen.shape(marker(origin).into(), marker_color, window);
         paint_line(&line, point(marker_left, top), window, cx);
+    }
+
+    fn paint_header(
+        &self,
+        header: &Row,
+        bounds: Bounds<Pixels>,
+        top: Pixels,
+        pen: &Pen,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Row::FileHeader {
+            status,
+            added,
+            deleted,
+            collapsed,
+            ..
+        } = header
+        else {
+            return;
+        };
+
+        let chevron = pen.shape(
+            disclosure(*collapsed).into(),
+            self.theme.muted_foreground,
+            window,
+        );
+        paint_line(
+            &chevron,
+            point(bounds.origin.x + px(HEADER_PADDING), top),
+            window,
+            cx,
+        );
+
+        window.paint_quad(
+            fill(
+                Bounds::new(
+                    point(bounds.origin.x + px(PASTILLE_LEFT), top + px(PASTILLE_TOP)),
+                    size(px(PASTILLE_SIZE), px(PASTILLE_SIZE)),
+                ),
+                status_color(status, &self.theme),
+            )
+            .corner_radii(px(PASTILLE_RADIUS)),
+        );
+
+        let count = pen.bold(
+            (added + deleted).to_string().into(),
+            self.theme.foreground,
+            window,
+        );
+        let count_right = bounds.right() - px(HEADER_PADDING);
+        paint_line(&count, point(count_right - count.width(), top), window, cx);
+
+        let Some(bar) = bar_widths(*added, *deleted, self.content.max_changes) else {
+            return;
+        };
+        let bar_right = count_right - px(BAR_GAP) - px(COUNT_WIDTH).max(count.width());
+        let bar_left = bar_right - px(bar.added + bar.deleted);
+        let bar_top = top + px(BAR_TOP);
+        for (offset, width, color) in [
+            (0., bar.added, self.theme.green),
+            (bar.added, bar.deleted, self.theme.red),
+        ] {
+            if width <= 0. {
+                continue;
+            }
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(bar_left + px(offset), bar_top),
+                    size(px(width), px(BAR_HEIGHT)),
+                ),
+                color,
+            ));
+        }
     }
 
     fn on_mouse_down(&self, bounds: Bounds<Pixels>, hitbox: &Hitbox, window: &mut Window) {
@@ -857,7 +992,13 @@ impl Element for DiffBody {
                     );
                 }
 
-                self.paint_gutter(row, column, cell_bounds, &pen, window, cx);
+                match self.rows().full(row) {
+                    Some(header @ Row::FileHeader { .. }) if column == 0 => {
+                        self.paint_header(header, bounds, top, &pen, window, cx);
+                    }
+                    Some(Row::FileHeader { .. }) => {}
+                    _ => self.paint_gutter(row, column, cell_bounds, &pen, window, cx),
+                }
                 self.texts[cell_offset].paint(
                     None,
                     None,
@@ -875,7 +1016,6 @@ impl Element for DiffBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::FileStatus;
 
     fn file_header() -> Row {
         Row::FileHeader {
@@ -983,10 +1123,7 @@ mod tests {
 
     #[test]
     fn a_row_renders_its_own_kind_of_text() {
-        assert_eq!(
-            row_text(&file_header()),
-            SharedString::from("src/main.rs  +3 \u{2212}1")
-        );
+        assert_eq!(row_text(&file_header()), SharedString::from("src/main.rs"));
         assert_eq!(row_text(&Row::Separator), SharedString::default());
         assert_eq!(
             row_text(&line(LineOrigin::Addition, "let x = 1;")),
@@ -1003,20 +1140,14 @@ mod tests {
     #[test]
     fn a_unified_cell_is_its_row() {
         let rows = Rows::Unified(vec![file_header(), line(LineOrigin::Deletion, "gone")]);
-        assert_eq!(
-            cell_text(&rows, 0),
-            SharedString::from("src/main.rs  +3 \u{2212}1")
-        );
+        assert_eq!(cell_text(&rows, 0), SharedString::from("src/main.rs"));
         assert_eq!(cell_text(&rows, 1), SharedString::from("gone"));
     }
 
     #[test]
     fn a_full_width_split_row_renders_in_the_first_column_and_blank_in_the_second() {
         let rows = split_rows();
-        assert_eq!(
-            cell_text(&rows, 0),
-            SharedString::from("src/main.rs  +3 \u{2212}1")
-        );
+        assert_eq!(cell_text(&rows, 0), SharedString::from("src/main.rs"));
         assert_eq!(cell_text(&rows, 1), SharedString::default());
     }
 
@@ -1028,6 +1159,118 @@ mod tests {
         assert_eq!(cell_text(&unified, 0), SharedString::default());
         assert_eq!(cell_text(&split, 0), SharedString::default());
         assert_eq!(cell_text(&split, 1), SharedString::default());
+    }
+
+    #[test]
+    fn a_header_starts_at_the_left_edge_and_every_other_row_past_its_gutters() {
+        let unified = Rows::Unified(vec![file_header(), line(LineOrigin::Context, "keep")]);
+        let split = split_rows();
+
+        assert_eq!(unified.cell_left(0), HEADER_TEXT_LEFT);
+        assert_eq!(unified.cell_left(1), CODE_LEFT);
+        assert_eq!(split.cell_left(0), HEADER_TEXT_LEFT);
+        assert_eq!(split.cell_left(1), SPLIT_CODE_LEFT);
+        assert!(
+            split.cell_left(0) < split.cell_left(1),
+            "a header is flush left, ahead of the narrowest code column"
+        );
+    }
+
+    #[test]
+    fn a_bar_is_the_files_share_of_the_widest_one_in_the_patch() {
+        assert_eq!(
+            bar_widths(30, 10, 40),
+            Some(Bar {
+                added: BAR_WIDTH * 0.75,
+                deleted: BAR_WIDTH * 0.25
+            }),
+            "the widest file fills the bar and splits it by its own two counts"
+        );
+        let half = bar_widths(10, 10, 40).expect("a changed file has a bar");
+        assert_eq!(half.added + half.deleted, BAR_WIDTH / 2.);
+        assert_eq!(half.added, half.deleted);
+    }
+
+    #[test]
+    fn a_patch_that_changes_nothing_draws_no_bar_and_divides_by_nothing() {
+        assert_eq!(bar_widths(0, 0, 0), None);
+        assert_eq!(
+            bar_widths(0, 0, 40),
+            None,
+            "a pure rename beside real changes is a bar of no length"
+        );
+    }
+
+    #[test]
+    fn a_file_of_one_kind_of_change_gets_one_segment_and_no_other() {
+        assert_eq!(
+            bar_widths(40, 0, 40),
+            Some(Bar {
+                added: BAR_WIDTH,
+                deleted: 0.
+            })
+        );
+        assert_eq!(
+            bar_widths(0, 40, 40),
+            Some(Bar {
+                added: 0.,
+                deleted: BAR_WIDTH
+            })
+        );
+    }
+
+    #[test]
+    fn a_bar_too_short_to_draw_is_widened_rather_than_lost() {
+        let one = bar_widths(1, 0, 1000).expect("one change still draws");
+        assert_eq!(one.added, BAR_MIN_WIDTH);
+        assert_eq!(one.deleted, 0.);
+
+        let pair = bar_widths(1, 1, 1000).expect("two changes still draw");
+        assert_eq!(pair.added, BAR_MIN_SEGMENT);
+        assert_eq!(pair.deleted, BAR_MIN_SEGMENT);
+    }
+
+    #[test]
+    fn a_segment_too_thin_to_see_keeps_its_minimum_without_lengthening_the_bar() {
+        let lopsided = bar_widths(1, 999, 1000).expect("a changed file has a bar");
+        assert_eq!(lopsided.added, BAR_MIN_SEGMENT);
+        assert_eq!(lopsided.added + lopsided.deleted, BAR_WIDTH);
+
+        let mirrored = bar_widths(999, 1, 1000).expect("a changed file has a bar");
+        assert_eq!(mirrored.deleted, BAR_MIN_SEGMENT);
+        assert_eq!(mirrored.added + mirrored.deleted, BAR_WIDTH);
+    }
+
+    #[test]
+    fn a_pastille_tells_an_addition_a_deletion_and_a_modification_apart() {
+        for theme in [ThemeColor::light(), ThemeColor::dark()] {
+            let colors = [
+                status_color(&FileStatus::Added, &theme),
+                status_color(&FileStatus::Deleted, &theme),
+                status_color(&FileStatus::Modified, &theme),
+            ];
+            for (i, a) in colors.iter().enumerate() {
+                for (j, b) in colors.iter().enumerate().skip(i + 1) {
+                    let distance = crate::theme_palette::rendered_distance(theme.secondary, *a, *b);
+                    assert!(
+                        distance > 0.06,
+                        "statuses {i} and {j} read as the same pastille (distance {distance:.3})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_move_and_a_type_change_share_one_pastille() {
+        let theme = ThemeColor::light();
+        let moved = status_color(&FileStatus::Renamed { similarity: 90 }, &theme);
+        assert_eq!(
+            status_color(&FileStatus::Copied { similarity: 90 }, &theme),
+            moved
+        );
+        assert_eq!(status_color(&FileStatus::TypeChanged, &theme), moved);
+        assert_ne!(moved, status_color(&FileStatus::Modified, &theme));
     }
 
     #[test]

@@ -1,5 +1,3 @@
-use std::fmt::Write as _;
-
 use domain::{DiffLine, FilePatch, FileStatus, Hunk, LineOrigin, Patch};
 
 use super::Collapsed;
@@ -49,13 +47,17 @@ pub(super) fn file_header(index: usize, file: &FilePatch, collapsed: bool) -> Ro
     }
 }
 
-pub(super) fn header_line(path: &str, status: &FileStatus, added: usize, deleted: usize) -> String {
-    let mut text = path.to_string();
-    if let Some(label) = status_label(status) {
-        let _ = write!(text, "  {label}");
-    }
-    let _ = write!(text, "  +{added} \u{2212}{deleted}");
-    text
+pub(super) fn header_line(path: &str) -> String {
+    path.to_string()
+}
+
+pub(super) fn max_changes(patch: &Patch) -> usize {
+    patch
+        .files
+        .iter()
+        .map(|file| file.added_lines() + file.deleted_lines())
+        .max()
+        .unwrap_or(0)
 }
 
 fn header_path(file: &FilePatch) -> String {
@@ -71,17 +73,6 @@ fn header_path(file: &FilePatch) -> String {
             .display_path()
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
-    }
-}
-
-fn status_label(status: &FileStatus) -> Option<String> {
-    match status {
-        FileStatus::Modified => None,
-        FileStatus::Added => Some("added".to_string()),
-        FileStatus::Deleted => Some("deleted".to_string()),
-        FileStatus::Renamed { similarity } => Some(format!("renamed {similarity}%")),
-        FileStatus::Copied { similarity } => Some(format!("copied {similarity}%")),
-        FileStatus::TypeChanged => Some("type changed".to_string()),
     }
 }
 
@@ -266,22 +257,16 @@ mod tests {
             "src/new.rs",
             FileStatus::Renamed { similarity: 87 },
         );
-        let Row::FileHeader {
-            path,
-            status,
-            added,
-            deleted,
-            ..
-        } = file_header(0, &file, false)
-        else {
+        let Row::FileHeader { path, status, .. } = file_header(0, &file, false) else {
             panic!("a file yields a header row");
         };
 
         assert_eq!(path, "src/old.rs \u{2192} src/new.rs");
         assert_eq!(status, FileStatus::Renamed { similarity: 87 });
         assert_eq!(
-            header_line(&path, &status, added, deleted),
-            "src/old.rs \u{2192} src/new.rs  renamed 87%  +0 \u{2212}0"
+            header_line(&path),
+            "src/old.rs \u{2192} src/new.rs",
+            "the similarity rides on the status, which is painted as a pastille"
         );
     }
 
@@ -292,22 +277,13 @@ mod tests {
             "src/copy.rs",
             FileStatus::Copied { similarity: 100 },
         );
-        let Row::FileHeader {
-            path,
-            status,
-            added,
-            deleted,
-            ..
-        } = file_header(0, &file, false)
-        else {
+        let Row::FileHeader { path, status, .. } = file_header(0, &file, false) else {
             panic!("a file yields a header row");
         };
 
         assert_eq!(path, "src/old.rs \u{2192} src/copy.rs");
-        assert_eq!(
-            header_line(&path, &status, added, deleted),
-            "src/old.rs \u{2192} src/copy.rs  copied 100%  +0 \u{2212}0"
-        );
+        assert_eq!(status, FileStatus::Copied { similarity: 100 });
+        assert_eq!(header_line(&path), "src/old.rs \u{2192} src/copy.rs");
     }
 
     #[test]
@@ -324,13 +300,12 @@ mod tests {
     }
 
     #[test]
-    fn a_modified_file_carries_no_status_label() {
+    fn a_header_line_carries_the_path_and_nothing_else() {
         let patch = Patch {
             files: vec![file(vec![one_line()], false)],
         };
         let Row::FileHeader {
             path,
-            status,
             added,
             deleted,
             ..
@@ -339,9 +314,12 @@ mod tests {
             panic!("the first row is the file header");
         };
 
+        assert_eq!(added, 1);
+        assert_eq!(deleted, 0);
         assert_eq!(
-            header_line(&path, &status, added, deleted),
-            "src/main.rs  +1 \u{2212}0"
+            header_line(&path),
+            "src/main.rs",
+            "the counts are painted, so a run cannot copy them with the path"
         );
     }
 
@@ -444,12 +422,7 @@ mod tests {
     fn a_collapsed_header_carries_the_flag_and_reads_exactly_as_an_expanded_one() {
         let file = file(vec![one_line()], false);
         let Row::FileHeader {
-            path,
-            status,
-            added,
-            deleted,
-            collapsed,
-            ..
+            path, collapsed, ..
         } = file_header(0, &file, true)
         else {
             panic!("a file yields a header row");
@@ -457,10 +430,41 @@ mod tests {
 
         assert!(collapsed);
         assert_eq!(
-            header_line(&path, &status, added, deleted),
-            "src/main.rs  +1 \u{2212}0",
-            "the disclosure marker is painted in the gutter, because a run would copy it"
+            header_line(&path),
+            "src/main.rs",
+            "the disclosure chevron is painted, because a run would copy it"
         );
+    }
+
+    #[test]
+    fn the_scale_is_the_largest_file_of_the_patch() {
+        let patch = Patch {
+            files: vec![
+                file(vec![one_line()], false),
+                file(
+                    vec![hunk(vec![
+                        line(LineOrigin::Addition, None, Some(1), "a"),
+                        line(LineOrigin::Addition, None, Some(2), "b"),
+                        line(LineOrigin::Deletion, Some(1), None, "c"),
+                    ])],
+                    false,
+                ),
+            ],
+        };
+        assert_eq!(max_changes(&patch), 3);
+    }
+
+    #[test]
+    fn a_patch_of_pure_renames_has_no_scale_to_divide_by() {
+        let patch = Patch {
+            files: vec![moved(
+                "src/old.rs",
+                "src/new.rs",
+                FileStatus::Renamed { similarity: 100 },
+            )],
+        };
+        assert_eq!(max_changes(&patch), 0);
+        assert_eq!(max_changes(&Patch::default()), 0);
     }
 
     #[test]
