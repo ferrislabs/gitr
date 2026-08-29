@@ -19,6 +19,27 @@
 //! out against `content_width / columns` and the width is measured over every cell, a
 //! full-width header still fits in the half it is drawn in.
 //!
+//! A file header is the one row that is not placed that way, because it is the one row that
+//! is not document. The code rows scroll horizontally because they *are* the thing being
+//! read; a header describes what is being read and belongs to the frame around it. So its
+//! chevron, pastille and path pin to the viewport's left edge and its bar and count to the
+//! viewport's right edge, inset by `gpui_component::scroll::Scrollbar::width()` so the count
+//! never sits under the overlay scrollbar. Only the background band still spans the element,
+//! which is what keeps a scrolled header reading as one continuous row rather than as a
+//! label floating over the code. The viewport is unmeasured on the first frame, exactly as
+//! it is for [`body::row_window`], and the fallback has the same shape: for that one frame
+//! the header falls back to the element's own edges and nothing is elided, and the second
+//! frame corrects it.
+//!
+//! Pinning is what bounds the path, and the bound is a single number per frame:
+//! `body::header_budget` is the viewport less the furniture at both ends, computed in
+//! `request_layout` beside the visible range. A path wider than it is elided from the
+//! *left* — `…detail/diff/split.rs` — because the tail of a path is what names the file and
+//! the head is the part that can be lost. The elided string is the one that becomes the run,
+//! so what is highlighted and what is copied still cannot drift apart. The price is the
+//! other half of that trade: copying a header whose path is too long for the panel yields
+//! the elided form, not the whole path.
+//!
 //! Selection comes back through `gpui-base`'s window-level participant system rather than
 //! from the editor. [`body`] is the element that joins it: it registers one participant and
 //! declares one run per cell on screen, left before right within a row, and only the code
@@ -26,7 +47,7 @@
 //! is painted directly and never registered: a line's gutters and its `+`/`−` marker, and a
 //! header's disclosure chevron, status pastille, change bar and change count. That is what
 //! keeps line numbers, markers and a file's statistics out of the clipboard, and it is why
-//! copying a header yields a bare path. The rows scroll on both axes rather than
+//! copying a header yields a bare path. The code rows scroll on both axes rather than
 //! soft-wrapping,
 //! matching GitHub. `restrict_scroll_to_axis` still earns its place here, but not for the
 //! reason it usually does: the container's `overflow_scroll()` puts both axes in
@@ -76,7 +97,11 @@
 //! largest file, derived by [`content`] when the patch, the view mode or the set of collapsed
 //! files changes and handed to the element behind an `Rc` thereafter. So after the first
 //! frame each cell is a hit in gpui's line-layout cache and the steady-state cost is a hash
-//! of bytes that are already there, with no allocation and no reshape. That last number is
+//! of bytes that are already there, with no allocation and no reshape. A header row is the
+//! exception in one respect: its elision binary-searches the tail against the shaped width,
+//! so it allocates a handful of candidates per header per frame. They are the same
+//! candidates every frame, so they settle into the same cache, and there are at most a
+//! screenful of headers — but it is a search, not a lookup. That last number is
 //! the scale every header's change bar is drawn against, and it belongs to the derivation for
 //! the same reason the strings do: a bar is a share of the widest file in the patch, so
 //! sizing one from the element would mean walking every file of the patch on every frame.

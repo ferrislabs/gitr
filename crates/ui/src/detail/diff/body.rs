@@ -10,7 +10,7 @@ use gpui::{
     relative, size,
 };
 use gpui_base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
-use gpui_component::{ThemeColor, ThemeMode};
+use gpui_component::{ThemeColor, ThemeMode, scroll::Scrollbar};
 
 use super::model::{Row, header_line};
 use super::pairing::SideLine;
@@ -45,6 +45,8 @@ const BAR_MIN_SEGMENT: f32 = 2.;
 const BAR_MIN_WIDTH: f32 = 2. * BAR_MIN_SEGMENT;
 const BAR_GAP: f32 = 8.;
 const COUNT_WIDTH: f32 = 34.;
+const HEADER_STATS_WIDTH: f32 = BAR_GAP + BAR_WIDTH + BAR_GAP + COUNT_WIDTH + HEADER_PADDING;
+const ELLIPSIS: &str = "\u{2026}";
 
 pub(super) enum Rows {
     Unified(Vec<Row>),
@@ -77,10 +79,15 @@ impl Rows {
         }
     }
 
+    fn is_header(&self, row: usize) -> bool {
+        matches!(self.full(row), Some(Row::FileHeader { .. }))
+    }
+
     fn cell_left(&self, row: usize) -> f32 {
-        match self.full(row) {
-            Some(Row::FileHeader { .. }) => HEADER_TEXT_LEFT,
-            _ => self.code_left(),
+        if self.is_header(row) {
+            HEADER_TEXT_LEFT
+        } else {
+            self.code_left()
         }
     }
 
@@ -139,6 +146,8 @@ pub(super) struct DiffBody {
     theme: ThemeColor,
     mode: ThemeMode,
     visible: Range<usize>,
+    path_budget: Option<Pixels>,
+    display: Vec<SharedString>,
     texts: Vec<StyledText>,
     cell_bounds: Vec<Bounds<Pixels>>,
 }
@@ -161,6 +170,8 @@ pub(super) fn body(
         theme,
         mode,
         visible: 0..0,
+        path_budget: None,
+        display: Vec::new(),
         texts: Vec::new(),
         cell_bounds: Vec::new(),
     }
@@ -258,6 +269,33 @@ fn bounds_for_cell(
             (column_width(bounds, columns) - left).max(px(0.)),
             px(ROW_HEIGHT),
         ),
+    )
+}
+
+fn header_budget(viewport: Pixels) -> Option<Pixels> {
+    if viewport <= px(0.) {
+        return None;
+    }
+    let furniture = px(HEADER_TEXT_LEFT + HEADER_STATS_WIDTH) + Scrollbar::width();
+    Some((viewport - furniture).max(px(0.)))
+}
+
+fn elide_path(path: &str, budget: f32, width: impl Fn(&str) -> f32) -> Option<String> {
+    if width(path) <= budget {
+        return None;
+    }
+    let tails: Vec<usize> = path
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .skip(1)
+        .chain([path.len()])
+        .collect();
+    let elided = |tail: usize| format!("{ELLIPSIS}{}", &path[tail..]);
+    let index = tails.partition_point(|tail| width(&elided(*tail)) > budget);
+    Some(
+        tails
+            .get(index)
+            .map_or_else(|| ELLIPSIS.to_string(), |tail| elided(*tail)),
     )
 }
 
@@ -543,13 +581,41 @@ impl DiffBody {
         &self.content.strings
     }
 
+    fn header_frame(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        if self.path_budget.is_some() {
+            self.scroll.bounds()
+        } else {
+            bounds
+        }
+    }
+
+    fn cell_string(&self, cell: usize, pen: &Pen, window: &Window) -> SharedString {
+        let text = self.content.strings[cell].clone();
+        let columns = self.rows().columns();
+        let Some(budget) = self
+            .path_budget
+            .filter(|_| self.rows().is_header(cell / columns))
+        else {
+            return text;
+        };
+        elide_path(&text, f32::from(budget), |candidate| {
+            f32::from(pen.width(candidate.to_string().into(), window))
+        })
+        .map_or(text, SharedString::from)
+    }
+
     fn cell_bounds_at(&self, bounds: Bounds<Pixels>, cell: usize) -> Bounds<Pixels> {
         let columns = self.rows().columns();
-        bounds_for_cell(
-            bounds,
-            columns,
-            px(self.rows().cell_left(cell / columns)),
-            cell,
+        let row = cell / columns;
+        let Some(budget) = self.path_budget.filter(|_| self.rows().is_header(row)) else {
+            return bounds_for_cell(bounds, columns, px(self.rows().cell_left(row)), cell);
+        };
+        Bounds::new(
+            point(
+                self.header_frame(bounds).origin.x + px(HEADER_TEXT_LEFT),
+                bounds.origin.y + px(row as f32 * ROW_HEIGHT),
+            ),
+            size(budget, px(ROW_HEIGHT)),
         )
     }
 
@@ -575,13 +641,13 @@ impl DiffBody {
         self.visible.start * columns..self.visible.end * columns
     }
 
-    fn whole_text(&self) -> String {
-        let ranges: Vec<Option<Range<usize>>> = self
-            .strings()
-            .iter()
-            .map(|text| Some(0..text.len()))
+    fn whole_text(&self, pen: &Pen, window: &Window) -> String {
+        let texts: Vec<SharedString> = (0..self.rows().cells())
+            .map(|cell| self.cell_string(cell, pen, window))
             .collect();
-        copy_text(self.strings(), &ranges, 0, self.rows().columns())
+        let ranges: Vec<Option<Range<usize>>> =
+            texts.iter().map(|text| Some(0..text.len())).collect();
+        copy_text(&texts, &ranges, 0, self.rows().columns())
     }
 
     fn copy_selection(
@@ -593,7 +659,7 @@ impl DiffBody {
         cx: &App,
     ) -> String {
         if self.select_all {
-            return self.whole_text();
+            return self.whole_text(pen, window);
         }
         let Some(points) = self
             .selection
@@ -616,27 +682,27 @@ impl DiffBody {
         let columns = self.rows().columns();
         let visible = self.visible_cells();
         let cells = rows.start() * columns..(rows.end() + 1) * columns;
+        let texts: Vec<SharedString> = cells
+            .clone()
+            .map(|cell| self.cell_string(cell, pen, window))
+            .collect();
         let ranges: Vec<Option<Range<usize>>> = cells
             .clone()
-            .map(|cell| {
+            .enumerate()
+            .map(|(offset, cell)| {
                 if visible.contains(&cell) {
                     return projected.get(cell - visible.start).and_then(Clone::clone);
                 }
                 let cell_bounds = self.cell_bounds_at(bounds, cell);
                 let band = selection_band(cell_bounds.origin.y, anchor, cursor)?;
-                let text = &self.strings()[cell];
+                let text = &texts[offset];
                 selected_range(text, band, cell_bounds.origin.x, || {
                     pen.measure(text.clone(), window)
                 })
             })
             .collect();
 
-        copy_text(
-            &self.strings()[cells.clone()],
-            &ranges,
-            cells.start,
-            columns,
-        )
+        copy_text(&texts, &ranges, cells.start, columns)
     }
 
     fn paint_background(
@@ -769,6 +835,7 @@ impl DiffBody {
             return;
         };
 
+        let frame = self.header_frame(bounds);
         let chevron = pen.shape(
             disclosure(*collapsed).into(),
             self.theme.muted_foreground,
@@ -776,7 +843,7 @@ impl DiffBody {
         );
         paint_line(
             &chevron,
-            point(bounds.origin.x + px(HEADER_PADDING), top),
+            point(frame.origin.x + px(HEADER_PADDING), top),
             window,
             cx,
         );
@@ -784,7 +851,7 @@ impl DiffBody {
         window.paint_quad(
             fill(
                 Bounds::new(
-                    point(bounds.origin.x + px(PASTILLE_LEFT), top + px(PASTILLE_TOP)),
+                    point(frame.origin.x + px(PASTILLE_LEFT), top + px(PASTILLE_TOP)),
                     size(px(PASTILLE_SIZE), px(PASTILLE_SIZE)),
                 ),
                 status_color(status, &self.theme),
@@ -797,7 +864,7 @@ impl DiffBody {
             self.theme.foreground,
             window,
         );
-        let count_right = bounds.right() - px(HEADER_PADDING);
+        let count_right = frame.right() - Scrollbar::width() - px(HEADER_PADDING);
         paint_line(&count, point(count_right - count.width(), top), window, cx);
 
         let Some(bar) = bar_widths(*added, *deleted, self.content.max_changes) else {
@@ -874,16 +941,18 @@ impl Element for DiffBody {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         self.visible = self.visible_rows();
+        self.path_budget = header_budget(self.scroll.bounds().size.width);
+
+        let pen = Pen::new(window);
+        let display: Vec<SharedString> = self
+            .visible_cells()
+            .map(|cell| self.cell_string(cell, &pen, window))
+            .collect();
+        self.display = display;
         self.texts = self
             .visible_cells()
-            .map(|cell| {
-                styled_cell(
-                    self.rows(),
-                    cell,
-                    self.content.strings[cell].clone(),
-                    &self.theme,
-                )
-            })
+            .zip(&self.display)
+            .map(|(cell, text)| styled_cell(self.rows(), cell, text.clone(), &self.theme))
             .collect();
 
         let children: Vec<LayoutId> = self
@@ -957,7 +1026,7 @@ impl Element for DiffBody {
             .map(|(offset, text)| {
                 let cell = first_cell + offset;
                 TextSelectionRun::new(
-                    self.content.strings[cell].clone(),
+                    self.display[offset].clone(),
                     text.layout().clone(),
                     self.cell_bounds[offset],
                 )
@@ -979,7 +1048,7 @@ impl Element for DiffBody {
                 let cell_offset = offset * columns + column;
                 let cell_bounds = self.cell_bounds[cell_offset];
                 let range = if self.select_all {
-                    Some(0..self.content.strings[first_cell + cell_offset].len())
+                    Some(0..self.display[cell_offset].len())
                 } else {
                     projection.ranges().get(cell_offset).and_then(Clone::clone)
                 };
@@ -1174,6 +1243,76 @@ mod tests {
             split.cell_left(0) < split.cell_left(1),
             "a header is flush left, ahead of the narrowest code column"
         );
+    }
+
+    fn monospace(text: &str) -> f32 {
+        text.chars().count() as f32
+    }
+
+    #[test]
+    fn a_path_that_fits_its_budget_is_left_alone() {
+        assert_eq!(elide_path("src/main.rs", 40., monospace), None);
+        assert_eq!(
+            elide_path("0123456789", 10., monospace),
+            None,
+            "a path exactly as wide as its budget still fits"
+        );
+        assert_eq!(elide_path("", 0., monospace), None);
+    }
+
+    #[test]
+    fn a_path_over_its_budget_loses_its_head_rather_than_its_tail() {
+        assert_eq!(
+            elide_path("crates/ui/src/detail.rs", 10., monospace),
+            Some("\u{2026}detail.rs".to_string()),
+            "the tail identifies the file, so the ellipsis leads"
+        );
+        assert_eq!(
+            elide_path("0123456789", 9.9, monospace),
+            Some("\u{2026}23456789".to_string()),
+            "one character over budget drops two, since the ellipsis takes one"
+        );
+    }
+
+    #[test]
+    fn an_elided_path_never_exceeds_the_budget_it_was_given() {
+        let path = "crates/ui/src/detail/diff/body.rs";
+        for budget in 2..=40 {
+            let budget = budget as f32;
+            let elided = elide_path(path, budget, monospace).unwrap_or_else(|| path.to_string());
+            assert!(
+                monospace(&elided) <= budget,
+                "{elided:?} overruns a budget of {budget}"
+            );
+            assert!(
+                path.ends_with(elided.trim_start_matches(ELLIPSIS)),
+                "{elided:?} is not a tail of {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_budget_too_small_for_the_ellipsis_itself_keeps_the_ellipsis() {
+        assert_eq!(
+            elide_path("src/main.rs", 0.5, monospace),
+            Some(ELLIPSIS.to_string()),
+            "nothing fits, so the row says so rather than drawing a misleading tail"
+        );
+        assert_eq!(
+            elide_path("src/main.rs", 1., monospace),
+            Some(ELLIPSIS.to_string())
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_viewport_has_no_budget_and_a_narrow_one_has_no_negative_budget() {
+        assert_eq!(header_budget(px(0.)), None);
+        assert_eq!(header_budget(px(-10.)), None);
+        assert_eq!(header_budget(px(1.)), Some(px(0.)));
+        let wide = header_budget(px(1000.)).expect("a measured viewport has a budget");
+        let narrow = header_budget(px(600.)).expect("a measured viewport has a budget");
+        assert_eq!(wide - narrow, px(400.), "the furniture is a fixed width");
+        assert!(narrow > px(0.));
     }
 
     #[test]
