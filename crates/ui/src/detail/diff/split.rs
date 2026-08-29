@@ -362,4 +362,26 @@ mod tests {
         assert!(matches!(rows[1], SplitRow::Sides { .. }));
         assert_eq!(rows.len(), 2);
     }
+
+    #[test]
+    fn an_empty_hunk_between_two_filled_ones_parts_them_only_once() {
+        let patch = Patch {
+            files: vec![file(
+                "src/a.rs",
+                vec![replacement(), hunk(Vec::new()), replacement()],
+                false,
+            )],
+        };
+
+        let rows = split_rows(&patch, &expanded());
+
+        assert_eq!(rows[2], SplitRow::Full(Row::Separator));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| **row == SplitRow::Full(Row::Separator))
+                .count(),
+            1
+        );
+        assert_eq!(rows.len(), 4);
+    }
 }
