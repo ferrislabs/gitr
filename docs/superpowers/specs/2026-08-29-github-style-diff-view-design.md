@@ -1,7 +1,7 @@
 # GitHub-style diff view
 
 Date: 2026-08-29
-Status: approved, not yet implemented
+Status: implemented
 
 ## The problem
 
@@ -94,14 +94,16 @@ warns about does not apply here.
 | `diff/mod.rs` | Entry point: picks the layout for the current `DiffViewMode`. |
 | `diff/model.rs` | `Row`: `FileHeader \| HunkHeader \| Line \| Placeholder`. Pure. |
 | `diff/pairing.rs` | Left/right pairing for the split view. Pure. |
-| `diff/body.rs` | The custom `Element`: visible-range windowing, hitbox, one selection participant, N runs, row painting. |
-| `diff/unified.rs` | Unified row geometry over `Vec<Row>`. |
+| `diff/body.rs` | The custom `Element`: visible-range windowing, hitbox, one selection participant, N runs, row painting, and the geometry of both views. |
 | `diff/split.rs` | Side-by-side row geometry over `Vec<SplitRow>`. |
 | `diff/palette.rs` | The four tint constants, moved from `decorations.rs`. |
 | `crates/ui/src/diff_view_mode.rs` | `DiffViewMode`, modelled on `theme_preference.rs`. |
 
-`model.rs` and `pairing.rs` hold the logic and carry the tests. `row.rs` holds the risk.
-The two layout modules should stay thin — they arrange rows, they do not decide anything.
+`model.rs` and `pairing.rs` hold the logic and carry the tests. `body.rs` holds the risk.
+A separate `diff/unified.rs` was planned and not written: the unified view differs from the
+split one only in its column count and the width of its gutters, so `body.rs` answers both
+from `Rows` rather than arranging each in a module of its own. `split.rs` stays thin — it
+arranges rows, it does not decide anything.
 
 ## Data model
 
@@ -136,15 +138,17 @@ hunk, a run at the very end with no trailing context, and a hunk of context only
 The body element registers one participant and declares that frame's visible rows as runs,
 in `prepaint`/`paint`:
 
-- `TextSelectionRegistration::new(hitbox, bounds)` with `.with_document_order(n)` so a drag
-  across rows copies in document order. `.with_scroll_offset(..)` is **not** called: gpui
-  prepaints scroll children inside `with_element_offset` (`div.rs:1925`), and
-  `Window::layout_bounds` folds that accumulated offset into `bounds.origin`
-  (`window.rs:4697`) — so this element's `bounds.origin` already carries the scroll.
-  `gpui-base` stores a selection endpoint as `position − bounds.origin − scroll_offset`
-  (`text_selection.rs:1336`), so reporting the offset as well double-counts it and the
-  anchor drifts at twice the scroll delta. `with_scroll_offset` is for a participant that
-  scrolls its own content inside fixed bounds, which this element does not do.
+- `TextSelectionRegistration::new(hitbox, viewport)` with `.with_document_order(n)` so a drag
+  across rows copies in document order, and `.with_scroll_offset(bounds.origin −
+  viewport.origin)`. `gpui-base` stores an endpoint as `position − bounds.origin −
+  scroll_offset` (`text_selection.rs:1336`) and resolves it back by adding both (`:806-812`),
+  so what matters is the sum. Reporting the element's own bounds and no offset gives the same
+  sum, and was what this was built with — but the registered *rectangle* is also the one
+  `AutoScroll::compute_delta` measures the pointer against (`:1452`), and the element's bounds
+  are the whole diff, not the part of it on screen, so the trigger zone sat off-screen and a
+  drag past the bottom edge never scrolled. Registering the viewport and reporting the
+  difference of the two origins keeps the sum identical by construction and puts the trigger
+  zone where the user can reach it.
 - `TextSelectionRun::new(text, layout, bounds)` — **only for the code content**. The
   gutters and the marker are neighbouring elements and are never registered, which is what
   makes a copied diff come out as clean code with no line numbers and no markers. This is
