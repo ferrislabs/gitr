@@ -62,10 +62,13 @@ A reference implementation exists at
 
 ## Decisions
 
-**No soft wrap; horizontal scrolling instead.** This is what GitHub does, and it is what
-makes virtualisation tractable: every row becomes exactly one line tall, so row heights are
-uniform and `virtual_list` applies directly. With soft wrap, heights vary per row and per
-viewport width, and the list has to measure before it can place.
+**No soft wrap; horizontal scrolling instead.** This is what GitHub does. It is a product
+choice, not a technical necessity — an earlier draft of this spec justified it by
+virtualisation, which was wrong: `v_virtual_list` takes `Rc<Vec<Size<Pixels>>>`, one size
+per item, and accepts freely varying heights. What soft wrap really costs is measurement —
+every row's wrapped height depends on the viewport width and has to be computed before
+anything can be placed. The choice stands on fidelity and on that cost, and can be
+revisited without invalidating the rest of this design.
 
 **The `+`/`-` marker stays, in a column of its own.** Sixteen pixels, between the gutters
 and the code, as in the deleted renderer. It no longer shifts the code, it carries the
@@ -91,9 +94,9 @@ warns about does not apply here.
 | `diff/mod.rs` | Entry point: picks the layout for the current `DiffViewMode`. |
 | `diff/model.rs` | `Row`: `FileHeader \| HunkHeader \| Line \| Placeholder`. Pure. |
 | `diff/pairing.rs` | Left/right pairing for the split view. Pure. |
-| `diff/row.rs` | The custom `Element`: hitbox, selection registration, run painting. |
-| `diff/unified.rs` | Unified layout over `Vec<Row>`. |
-| `diff/split.rs` | Side-by-side layout over `Vec<SplitRow>`. |
+| `diff/body.rs` | The custom `Element`: visible-range windowing, hitbox, one selection participant, N runs, row painting. |
+| `diff/unified.rs` | Unified row geometry over `Vec<Row>`. |
+| `diff/split.rs` | Side-by-side row geometry over `Vec<SplitRow>`. |
 | `diff/palette.rs` | The four tint constants, moved from `decorations.rs`. |
 | `crates/ui/src/diff_view_mode.rs` | `DiffViewMode`, modelled on `theme_preference.rs`. |
 
@@ -130,7 +133,8 @@ hunk, a run at the very end with no trailing context, and a hunk of context only
 
 ## Selection
 
-Each row registers a hitbox and one selectable run in `prepaint`/`paint`:
+The body element registers one participant and declares that frame's visible rows as runs,
+in `prepaint`/`paint`:
 
 - `TextSelectionRegistration::new(hitbox, bounds)` with `.with_document_order(n)` so a drag
   across rows copies in document order, and `.with_scroll_offset(..)` so the geometry stays
@@ -148,10 +152,20 @@ row.
 
 ## Virtualisation
 
-`gpui_component::virtual_list` over the derived row vector, with the uniform row height
-that dropping soft wrap gives us. Horizontal scrolling is the list's, shared across rows so
-the gutters stay put while the code scrolls — that behaviour needs to be verified early,
-because it is the part most likely to fight the selection layer's coordinates.
+**Not `virtual_list`.** That list produces one element per row, and the selection API runs
+the other way round: a participant declares all its runs in a single
+`update_runs(&[TextSelectionRun]) -> TextSelectionProjection` call, and the projection
+returns one `Option<Range<usize>>` per run, in the order given. Per-row elements sharing
+one handle would each overwrite the previous row's runs; a handle per row means one
+`Entity` per visible line, rebuilt on every scroll.
+
+The diff body is therefore **one custom `Element`** that computes its own visible range and
+paints the rows in it, registering a single participant and declaring that frame's visible
+rows as N runs in one call. Virtualisation is kept; it is hand-rolled rather than borrowed.
+
+This is more code than delegating to a list, and it is the single largest piece of work in
+this design. It is also not optional: it follows from the shape of the only selection API
+available.
 
 ## Toggle and persistence
 
@@ -202,11 +216,15 @@ Deliberately excluded from v1, each worth its own change:
 The custom `Element` is the risk, not the algorithm. Build it first, against the unified
 view alone, and prove three things before writing any split-view code: that a drag selects
 across row boundaries, that a copy yields code without gutters or markers, and that both
-survive scrolling a virtualised list. A bad surprise then arrives before the second view is
-written rather than after.
+survive scrolling. A bad surprise then arrives before the second view is written rather
+than after.
 
-Second risk: the interplay of `virtual_list` horizontal scrolling with the selection
-layer's coordinate handling. `with_scroll_offset` exists for this, but it is untested here.
+Second risk: the coordinate handling. `TextLayout::bounds`, `line_height`, `len`,
+`position_for_index` and `index_for_position` all panic when called before the text has been
+laid out — they `unwrap`/`expect` on an inner cell filled during prepaint. They are safe
+from `paint` and from nowhere earlier. Combined with hand-rolled windowing and a scroll
+offset reported through `with_scroll_offset`, this is where an implementation will go wrong
+if it goes wrong.
 
 ## Files touched
 
