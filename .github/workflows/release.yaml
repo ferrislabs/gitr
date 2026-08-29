@@ -31,8 +31,12 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c 'import sys, json; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "gitr_gui"))')"
+          pkgid="$(cargo pkgid -p gitr_gui)"
+          version="${pkgid##*@}"
+          if [ "${version}" = "${pkgid}" ]; then
+            echo "::error::cargo pkgid reported no version: ${pkgid}"
+            exit 1
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "gitr_gui is ${version}"
 
