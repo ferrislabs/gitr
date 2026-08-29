@@ -153,18 +153,36 @@ fn selected_rows(
     Some((first.max(0.) as usize)..=(last as usize).min(last_row))
 }
 
-fn selection_band(
-    row_top: Pixels,
-    anchor: Point<Pixels>,
-    cursor: Point<Pixels>,
-) -> Option<(Pixels, Pixels)> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Band {
+    Whole,
+    From(Pixels),
+    To(Pixels),
+    Between(Pixels, Pixels),
+}
+
+impl Band {
+    fn holds(self, x: Pixels) -> bool {
+        match self {
+            Band::Whole => true,
+            Band::From(low) => x >= low,
+            Band::To(high) => x <= high,
+            Band::Between(low, high) => x >= low && x <= high,
+        }
+    }
+}
+
+fn selection_band(row_top: Pixels, anchor: Point<Pixels>, cursor: Point<Pixels>) -> Option<Band> {
     let height = px(ROW_HEIGHT);
     let in_row = |point: Point<Pixels>| point.y >= row_top && point.y < row_top + height;
     if row_top + height <= anchor.y.min(cursor.y) || row_top > anchor.y.max(cursor.y) {
         return None;
     }
     if in_row(anchor) && in_row(cursor) {
-        return Some((anchor.x.min(cursor.x), anchor.x.max(cursor.x)));
+        return Some(Band::Between(
+            anchor.x.min(cursor.x),
+            anchor.x.max(cursor.x),
+        ));
     }
     let (start, end) = if anchor.y < cursor.y {
         (anchor, cursor)
@@ -172,31 +190,33 @@ fn selection_band(
         (cursor, anchor)
     };
     if in_row(start) {
-        Some((start.x, px(f32::MAX)))
+        Some(Band::From(start.x))
     } else if in_row(end) {
-        Some((px(f32::MIN), end.x))
+        Some(Band::To(end.x))
     } else {
-        Some((px(f32::MIN), px(f32::MAX)))
+        Some(Band::Whole)
     }
 }
 
 fn selected_range(
     text: &str,
-    line: &ShapedLine,
+    band: Band,
     left: Pixels,
-    band: (Pixels, Pixels),
+    line: impl FnOnce() -> ShapedLine,
 ) -> Option<Range<usize>> {
+    if band == Band::Whole {
+        return (!text.is_empty()).then_some(0..text.len());
+    }
+    let line = line();
     if text.len() != line.len() {
         return None;
     }
-    let (low, high) = band;
     let mut range: Option<Range<usize>> = None;
     let mut start = line.x_for_index(0);
     for (offset, character) in text.char_indices() {
         let next = offset + character.len_utf8();
         let end = line.x_for_index(next);
-        let middle = left + start + (end - start).half();
-        if middle >= low && middle <= high {
+        if band.holds(left + start + (end - start).half()) {
             range.get_or_insert(offset..offset).end = next;
         }
         start = end;
@@ -354,7 +374,7 @@ impl DiffBody {
                 let row_top = bounds.origin.y + px(index as f32 * ROW_HEIGHT);
                 let band = selection_band(row_top, anchor, cursor)?;
                 let text = &self.strings[index];
-                selected_range(text, &pen.measure(text.clone(), window), left, band)
+                selected_range(text, band, left, || pen.measure(text.clone(), window))
             })
             .collect();
 
@@ -621,6 +641,13 @@ mod tests {
     }
 
     #[test]
+    fn the_window_starts_at_the_first_row_when_the_view_is_over_scrolled_upwards() {
+        let window = row_window(px(60.), px(10. * ROW_HEIGHT), 500);
+        assert_eq!(window.start, 0);
+        assert_eq!(window.end, 12);
+    }
+
+    #[test]
     fn the_window_never_runs_past_the_last_row() {
         assert_eq!(
             row_window(px(-490. * ROW_HEIGHT), px(10. * ROW_HEIGHT), 500).end,
@@ -671,25 +698,51 @@ mod tests {
     #[test]
     fn a_row_holding_both_endpoints_is_bounded_by_them() {
         let band = selection_band(px(36.), point(px(80.), px(40.)), point(px(20.), px(50.)));
-        assert_eq!(band, Some((px(20.), px(80.))));
+        assert_eq!(band, Some(Band::Between(px(20.), px(80.))));
     }
 
     #[test]
     fn the_first_row_of_a_selection_runs_from_its_endpoint_to_the_end_of_the_line() {
         let band = selection_band(px(36.), point(px(80.), px(40.)), point(px(20.), px(200.)));
-        assert_eq!(band, Some((px(80.), px(f32::MAX))));
+        assert_eq!(band, Some(Band::From(px(80.))));
     }
 
     #[test]
     fn the_last_row_of_a_selection_runs_from_the_start_of_the_line_to_its_endpoint() {
         let band = selection_band(px(36.), point(px(80.), px(-10.)), point(px(20.), px(40.)));
-        assert_eq!(band, Some((px(f32::MIN), px(20.))));
+        assert_eq!(band, Some(Band::To(px(20.))));
     }
 
     #[test]
     fn a_row_between_the_endpoints_is_selected_whole() {
         let band = selection_band(px(36.), point(px(80.), px(-10.)), point(px(20.), px(200.)));
-        assert_eq!(band, Some((px(f32::MIN), px(f32::MAX))));
+        assert_eq!(band, Some(Band::Whole));
+    }
+
+    #[test]
+    fn a_drag_upwards_bands_its_rows_exactly_as_the_same_drag_downwards() {
+        let low = point(px(80.), px(40.));
+        let high = point(px(20.), px(200.));
+        let above = point(px(20.), px(-10.));
+
+        assert_eq!(
+            selection_band(px(36.), high, low),
+            selection_band(px(36.), low, high)
+        );
+        assert_eq!(
+            selection_band(px(36.), low, above),
+            selection_band(px(36.), above, low)
+        );
+        assert_eq!(
+            selection_band(px(36.), high, above),
+            selection_band(px(36.), above, high)
+        );
+        assert_eq!(
+            selection_band(px(36.), high, low),
+            Some(Band::From(px(80.)))
+        );
+        assert_eq!(selection_band(px(36.), low, above), Some(Band::To(px(80.))));
+        assert_eq!(selection_band(px(36.), high, above), Some(Band::Whole));
     }
 
     #[test]
@@ -698,5 +751,15 @@ mod tests {
         let below = selection_band(px(90.), point(px(80.), px(40.)), point(px(20.), px(50.)));
         assert_eq!(above, None);
         assert_eq!(below, None);
+    }
+
+    #[test]
+    fn a_whole_row_needs_no_shaping_and_an_empty_one_selects_nothing() {
+        let shape = || unreachable!("a whole row must not be shaped");
+        assert_eq!(
+            selected_range("one", Band::Whole, px(0.), shape),
+            Some(0..3)
+        );
+        assert_eq!(selected_range("", Band::Whole, px(0.), shape), None);
     }
 }

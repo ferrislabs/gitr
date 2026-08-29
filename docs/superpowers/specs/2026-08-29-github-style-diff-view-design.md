@@ -235,8 +235,12 @@ than after.
 
 Second risk: the coordinate handling. `TextLayout::bounds`, `line_height`, `len`,
 `position_for_index` and `index_for_position` all panic when called before the text has been
-laid out — they `unwrap`/`expect` on an inner cell filled during prepaint. They are safe
-from `paint` and from nowhere earlier. This is where hand-rolled windowing bites, and the
+laid out, but not on the same cell: `len` and `line_height` need only the one the measure
+closure fills (`text.rs:935-942`), while `bounds`, `position_for_index` and
+`index_for_position` need the one prepaint fills as well (`:830-837`, `:864-871`,
+`:930-932`). All five are safe from `paint` and from nowhere earlier — the distinction
+matters only when deciding which rows may be skipped. This is where hand-rolled windowing
+bites, and the
 two obvious moves are both wrong. Narrowing layout while keeping a run per row panics on the
 first scroll with a live selection, because `selection_range_for_run` reads `layout.len()` on
 every run it is handed. Narrowing the runs to match avoids the panic and silently truncates a
@@ -245,7 +249,9 @@ copy to whatever rows are on screen.
 The way out is that the copy does not have to come from the projection. `update_runs` covers
 the window and drives only the highlight; the copied text is derived from the selection's own
 window points, which are scroll-invariant, so the row span is arithmetic and only the two rows
-whose ends the selection cuts through need shaping at all. A row already on screen keeps the
+whose ends the selection cuts through need shaping at all — a row between them is whole by
+construction, and answering `0..len` for it must short-circuit before the shaper is reached
+rather than after, or the saving is only notional. A row already on screen keeps the
 projection's range, so the highlight and the clipboard cannot disagree. What stays unwindowed
 is the content-width measurement, which must consider every row or the horizontal scroll
 extent moves as the view scrolls vertically.

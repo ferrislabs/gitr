@@ -25,12 +25,14 @@
 //!
 //! "On screen" is decided in `request_layout`, not in `paint`, because laying a row out is
 //! the expensive half and nothing downstream can be narrowed without it. That ordering is
-//! forced rather than chosen: `TextLayout::len`, `bounds`, `line_height` and
-//! `position_for_index` each `expect` on cells filled during measure and prepaint
-//! (`gpui/src/elements/text.rs:864-871`), and `selection_range_for_run` reads `layout.len()`
-//! on *every* run it is handed (`text_selection.rs:388`), so a row whose `StyledText` was
-//! skipped this frame cannot be declared as a run at all — declaring it panics on the first
-//! scroll that has a live selection.
+//! forced rather than chosen: every `TextLayout` accessor panics on a row that was skipped,
+//! `len` and `line_height` on the cell the measure closure fills
+//! (`gpui/src/elements/text.rs:935-942`) and `bounds` and `position_for_index` on that one
+//! and on the cell prepaint fills as well (`:864-871`, `:930-932`). `selection_range_for_run`
+//! reads `layout.len()` on *every* run it is handed, before any geometry
+//! (`text_selection.rs:388`), so a row whose `StyledText` was skipped this frame cannot be
+//! declared as a run at all — declaring it panics on the first scroll that has a live
+//! selection.
 //!
 //! The copied text is therefore not read off that projection. A selection dragged past the
 //! bottom edge would come back holding only the rows that happened to be on screen, and
