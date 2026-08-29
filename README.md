@@ -6,10 +6,6 @@ and [gpui-component](https://github.com/longbridge/gpui-component).
 It replaces [GitX](https://github.com/rowanj/gitx), whose network operations crash on a
 modal-sheet assertion and whose subprocess `git` inherits a truncated GUI `PATH`.
 
-## Status
-
-Milestone 1 — read and visualise. Not yet usable.
-
 ## Requirements
 
 - macOS 15 or later
