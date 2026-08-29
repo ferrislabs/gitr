@@ -11,8 +11,9 @@ use std::sync::Arc;
 use domain::{BranchName, CommitSummary, ObjectId, Reference};
 use gpui::{
     AnyElement, App, Bounds, Context, Div, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathBuilder, Pixels, SharedString, Stateful, Styled as _, WeakEntity,
-    Window, canvas, div, fill, point, px, size,
+    ParentElement as _, PathBuilder, Pixels, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, fill, point,
+    prelude::FluentBuilder as _, px, relative, size,
 };
 use gpui_component::{
     ActiveTheme as _, ThemeColor, h_flex,
@@ -34,6 +35,8 @@ const SUBJECT_COLUMN: usize = 2;
 const AUTHOR_COLUMN: usize = 3;
 const DATE_COLUMN: usize = 4;
 const COLUMN_COUNT: usize = 5;
+
+const BADGE_STRIP_MAX_SHARE: f32 = 0.5;
 
 const SHA_COLUMN_WIDTH: Pixels = px(76.);
 const SUBJECT_COLUMN_WIDTH: Pixels = px(420.);
@@ -327,28 +330,53 @@ fn subject_cell(
     workspace: Option<&WeakEntity<Workspace>>,
     theme: &ThemeColor,
 ) -> AnyElement {
-    let head_branch = deletion.head.as_ref();
-
     h_flex()
         .h_full()
         .items_center()
         .gap_1()
         .px_2()
         .overflow_hidden()
-        .children(references.iter().enumerate().map(|(index, reference)| {
-            let badge = badges::render_badge(reference, head_branch, theme);
-            match deletable_branch(reference, deletion, workspace) {
-                Some((branch, switch_to, workspace)) => div()
-                    .id(("branch-badge", index))
-                    .child(badge)
-                    .context_menu(move |menu, _, _| {
-                        branch_menu(menu, &branch, switch_to.as_ref(), &workspace)
-                    })
-                    .into_any_element(),
-                None => badge.into_any_element(),
-            }
-        }))
+        .when(!references.is_empty(), |cell| {
+            cell.child(badge_strip(
+                commit.id, references, deletion, workspace, theme,
+            ))
+        })
         .child(div().truncate().child(commit.summary.clone()))
+        .into_any_element()
+}
+
+fn badge_strip(
+    commit: ObjectId,
+    references: &[Reference],
+    deletion: &Deletion,
+    workspace: Option<&WeakEntity<Workspace>>,
+    theme: &ThemeColor,
+) -> AnyElement {
+    let head_branch = deletion.head.as_ref();
+    let id = SharedString::from(format!("badges-{}", commit.to_hex_prefix(40)));
+
+    div()
+        .id(id)
+        .max_w(relative(BADGE_STRIP_MAX_SHARE))
+        .overflow_x_scroll()
+        .restrict_scroll_to_axis()
+        .child(
+            h_flex()
+                .gap_1()
+                .flex_none()
+                .children(references.iter().enumerate().map(|(index, reference)| {
+                    let badge = badges::render_badge(reference, head_branch, theme);
+                    let cell = div().id(("branch-badge", index)).flex_none().child(badge);
+                    match deletable_branch(reference, deletion, workspace) {
+                        Some((branch, switch_to, workspace)) => cell
+                            .context_menu(move |menu, _, _| {
+                                branch_menu(menu, &branch, switch_to.as_ref(), &workspace)
+                            })
+                            .into_any_element(),
+                        None => cell.into_any_element(),
+                    }
+                })),
+        )
         .into_any_element()
 }
 
