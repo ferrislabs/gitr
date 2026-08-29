@@ -23,6 +23,8 @@
 mod model;
 #[allow(dead_code)]
 mod pairing;
+#[allow(dead_code)]
+mod palette;
 
 use domain::Patch;
 use gpui::{AnyElement, App, Entity, IntoElement, ParentElement as _, Styled as _, div};
