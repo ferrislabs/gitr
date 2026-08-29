@@ -1,16 +1,13 @@
 use std::fmt::Write as _;
 
-use domain::{DiffLine, FilePatch, FileStatus, LineOrigin, Patch};
+use domain::{DiffLine, FilePatch, FileStatus, Hunk, LineOrigin, Patch};
 
 use super::Collapsed;
-
-const EXPANDED_MARKER: &str = "\u{25be}";
-const COLLAPSED_MARKER: &str = "\u{25b8}";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Row {
     FileHeader {
-        file: usize,
+        index: usize,
         path: String,
         status: FileStatus,
         added: usize,
@@ -31,40 +28,29 @@ pub(super) enum Row {
 
 pub(super) fn rows(patch: &Patch, collapsed: &Collapsed) -> Vec<Row> {
     let mut rows = Vec::new();
-    for (file, patch) in patch.files.iter().enumerate() {
-        rows.push(file_header(file, patch, collapsed.contains(&file)));
-        if collapsed.contains(&file) {
-            continue;
+    for (index, file) in patch.files.iter().enumerate() {
+        let is_collapsed = collapsed.contains(&index);
+        rows.push(file_header(index, file, is_collapsed));
+        if !is_collapsed {
+            push_body(&mut rows, file);
         }
-        push_body(&mut rows, patch);
     }
     rows
 }
 
-pub(super) fn file_header(file: usize, patch: &FilePatch, collapsed: bool) -> Row {
+pub(super) fn file_header(index: usize, file: &FilePatch, collapsed: bool) -> Row {
     Row::FileHeader {
-        file,
-        path: header_path(patch),
-        status: patch.status.clone(),
-        added: patch.added_lines(),
-        deleted: patch.deleted_lines(),
+        index,
+        path: header_path(file),
+        status: file.status.clone(),
+        added: file.added_lines(),
+        deleted: file.deleted_lines(),
         collapsed,
     }
 }
 
-pub(super) fn header_line(
-    path: &str,
-    status: &FileStatus,
-    added: usize,
-    deleted: usize,
-    collapsed: bool,
-) -> String {
-    let marker = if collapsed {
-        COLLAPSED_MARKER
-    } else {
-        EXPANDED_MARKER
-    };
-    let mut text = format!("{marker} {path}");
+pub(super) fn header_line(path: &str, status: &FileStatus, added: usize, deleted: usize) -> String {
+    let mut text = path.to_string();
     if let Some(label) = status_label(status) {
         let _ = write!(text, "  {label}");
     }
@@ -99,6 +85,10 @@ fn status_label(status: &FileStatus) -> Option<String> {
     }
 }
 
+pub(super) fn filled_hunks(file: &FilePatch) -> impl Iterator<Item = &Hunk> {
+    file.hunks.iter().filter(|hunk| !hunk.lines.is_empty())
+}
+
 pub(super) fn placeholder(file: &FilePatch) -> Option<Row> {
     if file.is_binary {
         return Some(Row::Placeholder {
@@ -118,7 +108,7 @@ fn push_body(rows: &mut Vec<Row>, file: &FilePatch) {
         rows.push(placeholder);
         return;
     }
-    for (position, hunk) in file.hunks.iter().enumerate() {
+    for (position, hunk) in filled_hunks(file).enumerate() {
         if position > 0 {
             rows.push(Row::Separator);
         }
@@ -290,8 +280,8 @@ mod tests {
         assert_eq!(path, "src/old.rs \u{2192} src/new.rs");
         assert_eq!(status, FileStatus::Renamed { similarity: 87 });
         assert_eq!(
-            header_line(&path, &status, added, deleted, false),
-            "\u{25be} src/old.rs \u{2192} src/new.rs  renamed 87%  +0 \u{2212}0"
+            header_line(&path, &status, added, deleted),
+            "src/old.rs \u{2192} src/new.rs  renamed 87%  +0 \u{2212}0"
         );
     }
 
@@ -315,8 +305,8 @@ mod tests {
 
         assert_eq!(path, "src/old.rs \u{2192} src/copy.rs");
         assert_eq!(
-            header_line(&path, &status, added, deleted, false),
-            "\u{25be} src/old.rs \u{2192} src/copy.rs  copied 100%  +0 \u{2212}0"
+            header_line(&path, &status, added, deleted),
+            "src/old.rs \u{2192} src/copy.rs  copied 100%  +0 \u{2212}0"
         );
     }
 
@@ -350,8 +340,8 @@ mod tests {
         };
 
         assert_eq!(
-            header_line(&path, &status, added, deleted, false),
-            "\u{25be} src/main.rs  +1 \u{2212}0"
+            header_line(&path, &status, added, deleted),
+            "src/main.rs  +1 \u{2212}0"
         );
     }
 
@@ -425,7 +415,7 @@ mod tests {
         assert!(matches!(
             rows[0],
             Row::FileHeader {
-                file: 0,
+                index: 0,
                 collapsed: false,
                 ..
             }
@@ -434,7 +424,7 @@ mod tests {
         assert!(matches!(
             rows[2],
             Row::FileHeader {
-                file: 1,
+                index: 1,
                 collapsed: true,
                 ..
             }
@@ -442,7 +432,7 @@ mod tests {
         assert!(matches!(
             rows[3],
             Row::FileHeader {
-                file: 2,
+                index: 2,
                 collapsed: false,
                 ..
             }
@@ -451,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_header_turns_its_disclosure_marker_sideways() {
+    fn a_collapsed_header_carries_the_flag_and_reads_exactly_as_an_expanded_one() {
         let file = file(vec![one_line()], false);
         let Row::FileHeader {
             path,
@@ -467,8 +457,35 @@ mod tests {
 
         assert!(collapsed);
         assert_eq!(
-            header_line(&path, &status, added, deleted, collapsed),
-            "\u{25b8} src/main.rs  +1 \u{2212}0"
+            header_line(&path, &status, added, deleted),
+            "src/main.rs  +1 \u{2212}0",
+            "the disclosure marker is painted in the gutter, because a run would copy it"
         );
+    }
+
+    #[test]
+    fn an_empty_hunk_yields_neither_a_line_nor_a_separator() {
+        let patch = Patch {
+            files: vec![file(vec![hunk(Vec::new()), one_line()], false)],
+        };
+
+        let rows = rows(&patch, &expanded());
+
+        assert!(matches!(rows[0], Row::FileHeader { .. }));
+        assert!(matches!(rows[1], Row::Line { .. }));
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_hunk_between_two_filled_ones_parts_them_only_once() {
+        let patch = Patch {
+            files: vec![file(vec![one_line(), hunk(Vec::new()), one_line()], false)],
+        };
+
+        let rows = rows(&patch, &expanded());
+
+        assert_eq!(rows[2], Row::Separator);
+        assert_eq!(rows.iter().filter(|row| **row == Row::Separator).count(), 1);
+        assert_eq!(rows.len(), 4);
     }
 }

@@ -71,11 +71,13 @@
 //! affordable only because the text it measures is not rebuilt with it: [`DiffContent`]
 //! holds the rows and one [`gpui::SharedString`] per cell, derived by [`content`] when the
 //! patch, the view mode or the set of collapsed files changes and handed to the element
-//! behind an `Rc` thereafter. Collapsing is applied in that derivation — the body rows of a
-//! collapsed file are never emitted — so the element windows, paints and selects over a
-//! shorter list and knows nothing of collapsing beyond mapping a click to a row. So
+//! behind an `Rc` thereafter. So
 //! after the first frame each cell is a hit in gpui's line-layout cache and the steady-state
 //! cost is a hash of bytes that are already there, with no allocation and no reshape.
+//! Collapsing is applied in that same derivation — the body rows of a collapsed file are
+//! never emitted — so the element windows, paints and selects over a shorter list and knows
+//! nothing of collapsing beyond mapping a click to a row and drawing a disclosure marker in
+//! the header's own gutter, which keeps that marker out of every run and every copy.
 //!
 //! Copying depends on a fact `gpui-base`'s own doc comment does not state. A participant's
 //! runs concatenate with no separator when `update_runs` projects them

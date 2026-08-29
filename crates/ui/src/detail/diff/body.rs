@@ -64,16 +64,23 @@ impl Rows {
         self.len() * self.columns()
     }
 
-    fn file_at(&self, row: usize) -> Option<usize> {
-        let row = match self {
-            Rows::Unified(rows) => rows.get(row)?,
+    fn marker_left(&self) -> f32 {
+        self.code_left() - MARKER_WIDTH + MARKER_PADDING
+    }
+
+    fn full(&self, row: usize) -> Option<&Row> {
+        match self {
+            Rows::Unified(rows) => rows.get(row),
             Rows::Split(rows) => match rows.get(row)? {
-                SplitRow::Full(full) => full,
-                SplitRow::Sides { .. } => return None,
+                SplitRow::Full(full) => Some(full),
+                SplitRow::Sides { .. } => None,
             },
-        };
-        match row {
-            Row::FileHeader { file, .. } => Some(*file),
+        }
+    }
+
+    fn file_at(&self, row: usize) -> Option<usize> {
+        match self.full(row)? {
+            Row::FileHeader { index, .. } => Some(*index),
             _ => None,
         }
     }
@@ -160,9 +167,8 @@ fn row_text(row: &Row) -> SharedString {
             status,
             added,
             deleted,
-            collapsed,
             ..
-        } => header_line(path, status, *added, *deleted, *collapsed).into(),
+        } => header_line(path, status, *added, *deleted).into(),
         Row::Separator => SharedString::default(),
         Row::Line { content, .. } => content.clone().into(),
         Row::Placeholder { message } => (*message).into(),
@@ -179,14 +185,8 @@ fn styled_cell(rows: &Rows, cell: usize, text: SharedString, theme: &ThemeColor)
 }
 
 fn cell_foreground(rows: &Rows, cell: usize, theme: &ThemeColor) -> Hsla {
-    let row = cell / rows.columns();
-    match rows {
-        Rows::Unified(rows) => row_foreground(&rows[row], theme),
-        Rows::Split(split) => match &split[row] {
-            SplitRow::Full(full) => row_foreground(full, theme),
-            SplitRow::Sides { .. } => theme.foreground,
-        },
-    }
+    rows.full(cell / rows.columns())
+        .map_or(theme.foreground, |full| row_foreground(full, theme))
 }
 
 fn row_foreground(row: &Row, theme: &ThemeColor) -> Hsla {
@@ -211,6 +211,10 @@ fn marker(origin: LineOrigin) -> &'static str {
         LineOrigin::Deletion => "\u{2212}",
         LineOrigin::Context => " ",
     }
+}
+
+fn disclosure(collapsed: bool) -> &'static str {
+    if collapsed { "\u{25b8}" } else { "\u{25be}" }
 }
 
 fn column_width(bounds: Bounds<Pixels>, columns: usize) -> Pixels {
@@ -573,15 +577,7 @@ impl DiffBody {
         window: &mut Window,
     ) {
         let columns = self.rows().columns();
-        let full_width = match self.rows() {
-            Rows::Unified(rows) => Some(&rows[row]),
-            Rows::Split(split) => match &split[row] {
-                SplitRow::Full(full) => Some(full),
-                SplitRow::Sides { .. } => None,
-            },
-        };
-
-        match full_width {
+        match self.rows().full(row) {
             Some(full) => {
                 if let Some(background) = row_background(full, &self.theme, self.mode) {
                     let band = Bounds::new(
@@ -627,8 +623,19 @@ impl DiffBody {
     ) {
         let left = cell_bounds.origin.x - px(self.rows().code_left());
         let top = cell_bounds.origin.y;
+        let marker_left = left + px(self.rows().marker_left());
         let muted = self.theme.muted_foreground;
-        let (origin, marker_left) = match self.rows() {
+
+        if let Some(header @ Row::FileHeader { collapsed, .. }) = self.rows().full(row) {
+            if column == 0 {
+                let color = row_foreground(header, &self.theme);
+                let line = pen.shape(disclosure(*collapsed).into(), color, window);
+                paint_line(&line, point(marker_left, top), window, cx);
+            }
+            return;
+        }
+
+        let origin = match self.rows() {
             Rows::Unified(rows) => {
                 let Row::Line {
                     origin,
@@ -657,7 +664,7 @@ impl DiffBody {
                     window,
                     cx,
                 );
-                (origin, left + px(2. * GUTTER_WIDTH + MARKER_PADDING))
+                origin
             }
             Rows::Split(_) => {
                 let Some(side) = self.rows().side(row, column) else {
@@ -672,7 +679,7 @@ impl DiffBody {
                     window,
                     cx,
                 );
-                (side.origin, left + px(GUTTER_WIDTH + MARKER_PADDING))
+                side.origin
             }
         };
 
@@ -872,7 +879,7 @@ mod tests {
 
     fn file_header() -> Row {
         Row::FileHeader {
-            file: 0,
+            index: 0,
             path: "src/main.rs".to_string(),
             status: FileStatus::Modified,
             added: 3,
@@ -923,6 +930,14 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_sits_in_the_last_gutter_a_view_has() {
+        let unified = Rows::Unified(vec![file_header()]);
+
+        assert_eq!(unified.marker_left(), 2. * GUTTER_WIDTH + MARKER_PADDING);
+        assert_eq!(split_rows().marker_left(), GUTTER_WIDTH + MARKER_PADDING);
+    }
+
+    #[test]
     fn an_empty_row_list_is_empty_in_either_view() {
         assert!(Rows::Unified(Vec::new()).is_empty());
         assert!(Rows::Split(Vec::new()).is_empty());
@@ -970,7 +985,7 @@ mod tests {
     fn a_row_renders_its_own_kind_of_text() {
         assert_eq!(
             row_text(&file_header()),
-            SharedString::from("\u{25be} src/main.rs  +3 \u{2212}1")
+            SharedString::from("src/main.rs  +3 \u{2212}1")
         );
         assert_eq!(row_text(&Row::Separator), SharedString::default());
         assert_eq!(
@@ -990,7 +1005,7 @@ mod tests {
         let rows = Rows::Unified(vec![file_header(), line(LineOrigin::Deletion, "gone")]);
         assert_eq!(
             cell_text(&rows, 0),
-            SharedString::from("\u{25be} src/main.rs  +3 \u{2212}1")
+            SharedString::from("src/main.rs  +3 \u{2212}1")
         );
         assert_eq!(cell_text(&rows, 1), SharedString::from("gone"));
     }
@@ -1000,7 +1015,7 @@ mod tests {
         let rows = split_rows();
         assert_eq!(
             cell_text(&rows, 0),
-            SharedString::from("\u{25be} src/main.rs  +3 \u{2212}1")
+            SharedString::from("src/main.rs  +3 \u{2212}1")
         );
         assert_eq!(cell_text(&rows, 1), SharedString::default());
     }
@@ -1016,9 +1031,15 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_header_turns_its_disclosure_marker_sideways() {
+    fn a_disclosure_marker_turns_sideways_when_its_file_is_collapsed() {
+        assert_eq!(disclosure(false), "\u{25be}");
+        assert_eq!(disclosure(true), "\u{25b8}");
+    }
+
+    #[test]
+    fn a_collapsed_header_reads_exactly_as_an_expanded_one() {
         let collapsed = Row::FileHeader {
-            file: 0,
+            index: 0,
             path: "src/main.rs".to_string(),
             status: FileStatus::Modified,
             added: 3,
@@ -1028,7 +1049,8 @@ mod tests {
 
         assert_eq!(
             row_text(&collapsed),
-            SharedString::from("\u{25b8} src/main.rs  +3 \u{2212}1")
+            row_text(&file_header()),
+            "the marker is painted in the gutter, so no run and no copy can carry it"
         );
     }
 
