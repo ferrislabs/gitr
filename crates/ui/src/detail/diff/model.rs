@@ -2,7 +2,6 @@ use domain::{DiffLine, FilePatch, LineOrigin, Patch};
 
 use crate::detail::format;
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Row {
     FileHeader {
@@ -23,7 +22,6 @@ pub(super) enum Row {
     },
 }
 
-#[allow(dead_code)]
 pub(super) fn rows(patch: &Patch) -> Vec<Row> {
     let mut rows = Vec::new();
     for file in &patch.files {
@@ -39,12 +37,10 @@ pub(super) fn rows(patch: &Patch) -> Vec<Row> {
     rows
 }
 
-#[allow(dead_code)]
 pub(super) fn file_stat(file: &FilePatch) -> String {
     format!("+{} \u{2212}{}", file.added_lines(), file.deleted_lines())
 }
 
-#[allow(dead_code)]
 fn push_body(rows: &mut Vec<Row>, file: &FilePatch) {
     if file.is_binary {
         rows.push(Row::Placeholder {
@@ -66,7 +62,6 @@ fn push_body(rows: &mut Vec<Row>, file: &FilePatch) {
     }
 }
 
-#[allow(dead_code)]
 fn line_row(line: &DiffLine) -> Row {
     Row::Line {
         origin: line.origin,

@@ -1,25 +1,26 @@
-mod model;
+//! Renders a `Patch` inside a single readonly code editor, instead of one hand-built
+//! `div` per diff line.
+//!
+//! A hand-built row per line means every element for the whole patch is constructed on
+//! every render, selects nothing, and highlights nothing beyond a full-width background
+//! tint. Feeding [`super::format::unified_diff_text`] into a real
+//! [`gpui_component::input::Editor`] gets text selection, `tree-sitter-diff` syntax
+//! highlighting, and virtualised scrolling that only lays out the lines actually on
+//! screen — for free, from the editor.
+//!
+//! One [`Editor`] holds the whole patch rather than one per file: a diff reads as a
+//! single continuous document (this is how `git diff` and a GitHub raw patch view both
+//! present it), a single scrollbar matches the rest of the panel, and it avoids creating
+//! and tearing down one [`EditorState`] entity per file on every commit selection. The
+//! trade-off is that per-file collapsing isn't available; nothing in this panel asks for
+//! it.
+//!
+//! [`super::DetailPanel`] owns the [`EditorState`] entity and is the one that pushes new
+//! text into it — this module only builds the element each render, exactly like the rest
+//! of the panel's view functions.
 
-// Renders a `Patch` inside a single readonly code editor, instead of one hand-built
-// `div` per diff line.
-//
-// A hand-built row per line means every element for the whole patch is constructed on
-// every render, selects nothing, and highlights nothing beyond a full-width background
-// tint. Feeding [`super::format::unified_diff_text`] into a real
-// [`gpui_component::input::Editor`] gets text selection, `tree-sitter-diff` syntax
-// highlighting, and virtualised scrolling that only lays out the lines actually on
-// screen — for free, from the editor.
-//
-// One [`Editor`] holds the whole patch rather than one per file: a diff reads as a
-// single continuous document (this is how `git diff` and a GitHub raw patch view both
-// present it), a single scrollbar matches the rest of the panel, and it avoids creating
-// and tearing down one [`EditorState`] entity per file on every commit selection. The
-// trade-off is that per-file collapsing isn't available; nothing in this panel asks for
-// it.
-//
-// [`super::DetailPanel`] owns the [`EditorState`] entity and is the one that pushes new
-// text into it — this module only builds the element each render, exactly like the rest
-// of the panel's view functions.
+#[allow(dead_code)]
+mod model;
 
 use domain::Patch;
 use gpui::{AnyElement, App, Entity, IntoElement, ParentElement as _, Styled as _, div};
