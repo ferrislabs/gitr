@@ -1,33 +1,50 @@
 use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
 
-use domain::LineOrigin;
+use domain::FileStatus;
 use gpui::{
-    App, Bounds, Element, ElementId, FlexDirection, GlobalElementId, Half as _, HighlightStyle,
-    Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, Length, Pixels, Point,
-    ScrollHandle, ShapedLine, SharedString, Style, StyledText, TextAlign, TextLayout, TextStyle,
-    Window, fill, point, px, relative, size,
+    App, Bounds, DispatchPhase, Element, ElementId, FlexDirection, FontWeight, GlobalElementId,
+    Half as _, HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
+    LayoutId, Length, MouseButton, MouseDownEvent, Pixels, Point, ScrollHandle, ShapedLine,
+    SharedString, Style, StyledText, TextAlign, TextLayout, TextStyle, Window, fill, point, px,
+    relative, size,
 };
 use gpui_base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
-use gpui_component::{ThemeColor, ThemeMode};
+use gpui_component::{ThemeColor, ThemeMode, scroll::Scrollbar};
 
-use super::DiffContent;
-use super::model::{Row, header_line};
+use super::model::Row;
 use super::pairing::SideLine;
-use super::palette::line_colors;
+use super::palette::line_background;
 use super::split::SplitRow;
+use super::{DiffContent, ToggleFile};
 
 pub(super) const ROW_HEIGHT: f32 = 18.;
 
 const GUTTER_WIDTH: f32 = 44.;
-const MARKER_WIDTH: f32 = 16.;
 const GUTTER_PADDING: f32 = 8.;
-const MARKER_PADDING: f32 = 5.;
-const CODE_LEFT: f32 = 2. * GUTTER_WIDTH + MARKER_WIDTH;
-const SPLIT_CODE_LEFT: f32 = GUTTER_WIDTH + MARKER_WIDTH;
+const CODE_LEFT: f32 = 2. * GUTTER_WIDTH;
+const SPLIT_CODE_LEFT: f32 = GUTTER_WIDTH;
 const COLUMN_RULE_WIDTH: f32 = 1.;
 const TRAILING_SPACE: f32 = 16.;
 const UNMEASURED_ROWS: usize = 100;
+
+const HEADER_PADDING: f32 = 8.;
+const DISCLOSURE_WIDTH: f32 = 12.;
+const PASTILLE_SIZE: f32 = 8.;
+const PASTILLE_RADIUS: f32 = 2.;
+const PASTILLE_GAP: f32 = 8.;
+const PASTILLE_LEFT: f32 = HEADER_PADDING + DISCLOSURE_WIDTH;
+const PASTILLE_TOP: f32 = (ROW_HEIGHT - PASTILLE_SIZE) / 2.;
+const HEADER_TEXT_LEFT: f32 = PASTILLE_LEFT + PASTILLE_SIZE + PASTILLE_GAP;
+const BAR_WIDTH: f32 = 64.;
+const BAR_HEIGHT: f32 = 8.;
+const BAR_TOP: f32 = (ROW_HEIGHT - BAR_HEIGHT) / 2.;
+const BAR_MIN_SEGMENT: f32 = 2.;
+const BAR_MIN_WIDTH: f32 = 2. * BAR_MIN_SEGMENT;
+const BAR_GAP: f32 = 8.;
+const COUNT_WIDTH: f32 = 34.;
+const HEADER_STATS_WIDTH: f32 = BAR_GAP + BAR_WIDTH + BAR_GAP + COUNT_WIDTH + HEADER_PADDING;
+const ELLIPSIS: &str = "\u{2026}";
 
 pub(super) enum Rows {
     Unified(Vec<Row>),
@@ -35,7 +52,7 @@ pub(super) enum Rows {
 }
 
 impl Rows {
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         match self {
             Rows::Unified(rows) => rows.len(),
             Rows::Split(rows) => rows.len(),
@@ -60,8 +77,37 @@ impl Rows {
         }
     }
 
+    fn is_header(&self, row: usize) -> bool {
+        matches!(self.full(row), Some(Row::FileHeader { .. }))
+    }
+
+    fn cell_left(&self, row: usize) -> f32 {
+        if self.is_header(row) {
+            HEADER_TEXT_LEFT
+        } else {
+            self.code_left()
+        }
+    }
+
     fn cells(&self) -> usize {
         self.len() * self.columns()
+    }
+
+    fn full(&self, row: usize) -> Option<&Row> {
+        match self {
+            Rows::Unified(rows) => rows.get(row),
+            Rows::Split(rows) => match rows.get(row)? {
+                SplitRow::Full(full) => Some(full),
+                SplitRow::Sides { .. } => None,
+            },
+        }
+    }
+
+    fn file_at(&self, row: usize) -> Option<usize> {
+        match self.full(row)? {
+            Row::FileHeader { index, .. } => Some(*index),
+            _ => None,
+        }
     }
 
     fn side(&self, row: usize, column: usize) -> Option<&SideLine> {
@@ -90,9 +136,12 @@ pub(super) struct DiffBody {
     select_all: bool,
     selection: TextSelectionHandle,
     scroll: ScrollHandle,
+    toggle_file: ToggleFile,
     theme: ThemeColor,
     mode: ThemeMode,
     visible: Range<usize>,
+    path_budget: Option<Pixels>,
+    display: Vec<SharedString>,
     texts: Vec<StyledText>,
     cell_bounds: Vec<Bounds<Pixels>>,
 }
@@ -102,6 +151,7 @@ pub(super) fn body(
     select_all: bool,
     selection: TextSelectionHandle,
     scroll: ScrollHandle,
+    toggle_file: ToggleFile,
     theme: ThemeColor,
     mode: ThemeMode,
 ) -> DiffBody {
@@ -110,9 +160,12 @@ pub(super) fn body(
         select_all,
         selection,
         scroll,
+        toggle_file,
         theme,
         mode,
         visible: 0..0,
+        path_budget: None,
+        display: Vec::new(),
         texts: Vec::new(),
         cell_bounds: Vec::new(),
     }
@@ -138,13 +191,8 @@ fn cell_text(rows: &Rows, cell: usize) -> SharedString {
 
 fn row_text(row: &Row) -> SharedString {
     match row {
-        Row::FileHeader {
-            path,
-            status,
-            added,
-            deleted,
-        } => header_line(path, status, *added, *deleted).into(),
-        Row::HunkHeader { text } => text.clone().into(),
+        Row::FileHeader { path, .. } => path.clone().into(),
+        Row::Separator => SharedString::default(),
         Row::Line { content, .. } => content.clone().into(),
         Row::Placeholder { message } => (*message).into(),
     }
@@ -160,38 +208,28 @@ fn styled_cell(rows: &Rows, cell: usize, text: SharedString, theme: &ThemeColor)
 }
 
 fn cell_foreground(rows: &Rows, cell: usize, theme: &ThemeColor) -> Hsla {
-    let row = cell / rows.columns();
-    match rows {
-        Rows::Unified(rows) => row_foreground(&rows[row], theme),
-        Rows::Split(split) => match &split[row] {
-            SplitRow::Full(full) => row_foreground(full, theme),
-            SplitRow::Sides { .. } => theme.foreground,
-        },
-    }
+    rows.full(cell / rows.columns())
+        .map_or(theme.foreground, |full| row_foreground(full, theme))
 }
 
 fn row_foreground(row: &Row, theme: &ThemeColor) -> Hsla {
     match row {
         Row::FileHeader { .. } | Row::Line { .. } => theme.foreground,
-        Row::HunkHeader { .. } | Row::Placeholder { .. } => theme.muted_foreground,
+        Row::Separator | Row::Placeholder { .. } => theme.muted_foreground,
     }
 }
 
 fn row_background(row: &Row, theme: &ThemeColor, mode: ThemeMode) -> Option<Hsla> {
     match row {
         Row::FileHeader { .. } => Some(theme.secondary),
-        Row::HunkHeader { .. } => Some(theme.muted),
+        Row::Separator => Some(theme.muted),
         Row::Placeholder { .. } => None,
-        Row::Line { origin, .. } => line_colors(*origin, mode, theme).background,
+        Row::Line { origin, .. } => line_background(*origin, mode),
     }
 }
 
-fn marker(origin: LineOrigin) -> &'static str {
-    match origin {
-        LineOrigin::Addition => "+",
-        LineOrigin::Deletion => "\u{2212}",
-        LineOrigin::Context => " ",
-    }
+fn disclosure(collapsed: bool) -> &'static str {
+    if collapsed { "\u{25b8}" } else { "\u{25be}" }
 }
 
 fn column_width(bounds: Bounds<Pixels>, columns: usize) -> Pixels {
@@ -205,19 +243,90 @@ fn column_left(bounds: Bounds<Pixels>, columns: usize, column: usize) -> Pixels 
 fn bounds_for_cell(
     bounds: Bounds<Pixels>,
     columns: usize,
-    code_left: Pixels,
+    left: Pixels,
     cell: usize,
 ) -> Bounds<Pixels> {
     Bounds::new(
         point(
-            column_left(bounds, columns, cell % columns) + code_left,
+            column_left(bounds, columns, cell % columns) + left,
             bounds.origin.y + px((cell / columns) as f32 * ROW_HEIGHT),
         ),
         size(
-            (column_width(bounds, columns) - code_left).max(px(0.)),
+            (column_width(bounds, columns) - left).max(px(0.)),
             px(ROW_HEIGHT),
         ),
     )
+}
+
+fn header_budget(viewport: Pixels) -> Option<Pixels> {
+    if viewport <= px(0.) {
+        return None;
+    }
+    let furniture = px(HEADER_TEXT_LEFT + HEADER_STATS_WIDTH) + Scrollbar::width();
+    Some((viewport - furniture).max(px(0.)))
+}
+
+fn count_right_edge(frame_right: Pixels) -> Pixels {
+    frame_right - Scrollbar::width() - px(HEADER_PADDING)
+}
+
+fn bar_right_edge(frame_right: Pixels, count_width: Pixels) -> Pixels {
+    count_right_edge(frame_right) - px(BAR_GAP) - px(COUNT_WIDTH).max(count_width)
+}
+
+fn elide_path(path: &str, budget: f32, width: impl Fn(&str) -> f32) -> Option<String> {
+    if width(path) <= budget {
+        return None;
+    }
+    let tails: Vec<usize> = path
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .skip(1)
+        .chain([path.len()])
+        .collect();
+    let elided = |tail: usize| format!("{ELLIPSIS}{}", &path[tail..]);
+    let index = tails.partition_point(|tail| width(&elided(*tail)) > budget);
+    Some(
+        tails
+            .get(index)
+            .map_or_else(|| ELLIPSIS.to_string(), |tail| elided(*tail)),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Bar {
+    added: f32,
+    deleted: f32,
+}
+
+fn bar_widths(added: usize, deleted: usize, max_changes: usize) -> Option<Bar> {
+    let total = added + deleted;
+    if total == 0 || max_changes == 0 {
+        return None;
+    }
+    let width = (BAR_WIDTH * total as f32 / max_changes as f32).max(BAR_MIN_WIDTH);
+    let mut green = width * added as f32 / total as f32;
+    if added > 0 {
+        green = green.max(BAR_MIN_SEGMENT);
+    }
+    if deleted > 0 {
+        green = green.min(width - BAR_MIN_SEGMENT);
+    }
+    Some(Bar {
+        added: green,
+        deleted: width - green,
+    })
+}
+
+fn status_color(status: &FileStatus, theme: &ThemeColor) -> Hsla {
+    match status {
+        FileStatus::Added => theme.green,
+        FileStatus::Deleted => theme.red,
+        FileStatus::Modified => theme.blue,
+        FileStatus::Renamed { .. } | FileStatus::Copied { .. } | FileStatus::TypeChanged => {
+            theme.muted_foreground
+        }
+    }
 }
 
 fn selection_quad_bounds(
@@ -257,6 +366,11 @@ fn row_window(offset_y: Pixels, viewport: Pixels, rows: usize) -> Range<usize> {
     let first = ((-offset_y) / px(ROW_HEIGHT)).floor().max(0.) as usize;
     let count = (viewport / px(ROW_HEIGHT)).ceil() as usize + 2;
     first.min(rows)..first.saturating_add(count).min(rows)
+}
+
+fn row_at(origin_y: Pixels, y: Pixels, rows: usize) -> Option<usize> {
+    let row = ((y - origin_y) / px(ROW_HEIGHT)).floor();
+    (row >= 0. && row < rows as f32).then_some(row as usize)
 }
 
 fn selected_rows(
@@ -400,8 +514,23 @@ impl Pen {
     }
 
     fn shape(&self, text: SharedString, color: Hsla, window: &Window) -> ShapedLine {
+        self.weighted(text, color, self.style.font_weight, window)
+    }
+
+    fn bold(&self, text: SharedString, color: Hsla, window: &Window) -> ShapedLine {
+        self.weighted(text, color, FontWeight::BOLD, window)
+    }
+
+    fn weighted(
+        &self,
+        text: SharedString,
+        color: Hsla,
+        weight: FontWeight,
+        window: &Window,
+    ) -> ShapedLine {
         let mut run = self.style.to_run(text.len());
         run.color = color;
+        run.font.weight = weight;
         window
             .text_system()
             .shape_line(text, self.font_size, &[run], None)
@@ -446,12 +575,41 @@ impl DiffBody {
         &self.content.strings
     }
 
+    fn header_frame(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        if self.path_budget.is_some() {
+            self.scroll.bounds()
+        } else {
+            bounds
+        }
+    }
+
+    fn cell_string(&self, cell: usize, pen: &Pen, window: &Window) -> SharedString {
+        let text = self.content.strings[cell].clone();
+        let columns = self.rows().columns();
+        let Some(budget) = self
+            .path_budget
+            .filter(|_| self.rows().is_header(cell / columns))
+        else {
+            return text;
+        };
+        elide_path(&text, f32::from(budget), |candidate| {
+            f32::from(pen.width(candidate.to_string().into(), window))
+        })
+        .map_or(text, SharedString::from)
+    }
+
     fn cell_bounds_at(&self, bounds: Bounds<Pixels>, cell: usize) -> Bounds<Pixels> {
-        bounds_for_cell(
-            bounds,
-            self.rows().columns(),
-            px(self.rows().code_left()),
-            cell,
+        let columns = self.rows().columns();
+        let row = cell / columns;
+        let Some(budget) = self.path_budget.filter(|_| self.rows().is_header(row)) else {
+            return bounds_for_cell(bounds, columns, px(self.rows().cell_left(row)), cell);
+        };
+        Bounds::new(
+            point(
+                self.header_frame(bounds).origin.x + px(HEADER_TEXT_LEFT),
+                bounds.origin.y + px(row as f32 * ROW_HEIGHT),
+            ),
+            size(budget, px(ROW_HEIGHT)),
         )
     }
 
@@ -477,13 +635,13 @@ impl DiffBody {
         self.visible.start * columns..self.visible.end * columns
     }
 
-    fn whole_text(&self) -> String {
-        let ranges: Vec<Option<Range<usize>>> = self
-            .strings()
-            .iter()
-            .map(|text| Some(0..text.len()))
+    fn whole_text(&self, pen: &Pen, window: &Window) -> String {
+        let texts: Vec<SharedString> = (0..self.rows().cells())
+            .map(|cell| self.cell_string(cell, pen, window))
             .collect();
-        copy_text(self.strings(), &ranges, 0, self.rows().columns())
+        let ranges: Vec<Option<Range<usize>>> =
+            texts.iter().map(|text| Some(0..text.len())).collect();
+        copy_text(&texts, &ranges, 0, self.rows().columns())
     }
 
     fn copy_selection(
@@ -495,7 +653,7 @@ impl DiffBody {
         cx: &App,
     ) -> String {
         if self.select_all {
-            return self.whole_text();
+            return self.whole_text(pen, window);
         }
         let Some(points) = self
             .selection
@@ -518,27 +676,37 @@ impl DiffBody {
         let columns = self.rows().columns();
         let visible = self.visible_cells();
         let cells = rows.start() * columns..(rows.end() + 1) * columns;
-        let ranges: Vec<Option<Range<usize>>> = cells
+        let displayed = |cell: usize| {
+            visible
+                .contains(&cell)
+                .then(|| self.display.get(cell - visible.start))
+                .flatten()
+        };
+        let texts: Vec<SharedString> = cells
             .clone()
             .map(|cell| {
-                if visible.contains(&cell) {
+                displayed(cell)
+                    .cloned()
+                    .unwrap_or_else(|| self.cell_string(cell, pen, window))
+            })
+            .collect();
+        let ranges: Vec<Option<Range<usize>>> = cells
+            .clone()
+            .enumerate()
+            .map(|(offset, cell)| {
+                if displayed(cell).is_some() {
                     return projected.get(cell - visible.start).and_then(Clone::clone);
                 }
                 let cell_bounds = self.cell_bounds_at(bounds, cell);
                 let band = selection_band(cell_bounds.origin.y, anchor, cursor)?;
-                let text = &self.strings()[cell];
+                let text = &texts[offset];
                 selected_range(text, band, cell_bounds.origin.x, || {
                     pen.measure(text.clone(), window)
                 })
             })
             .collect();
 
-        copy_text(
-            &self.strings()[cells.clone()],
-            &ranges,
-            cells.start,
-            columns,
-        )
+        copy_text(&texts, &ranges, cells.start, columns)
     }
 
     fn paint_background(
@@ -549,15 +717,7 @@ impl DiffBody {
         window: &mut Window,
     ) {
         let columns = self.rows().columns();
-        let full_width = match self.rows() {
-            Rows::Unified(rows) => Some(&rows[row]),
-            Rows::Split(split) => match &split[row] {
-                SplitRow::Full(full) => Some(full),
-                SplitRow::Sides { .. } => None,
-            },
-        };
-
-        match full_width {
+        match self.rows().full(row) {
             Some(full) => {
                 if let Some(background) = row_background(full, &self.theme, self.mode) {
                     let band = Bounds::new(
@@ -569,9 +729,11 @@ impl DiffBody {
             }
             None => {
                 for column in 0..columns {
-                    let Some(background) = self.rows().side(row, column).and_then(|side| {
-                        line_colors(side.origin, self.mode, &self.theme).background
-                    }) else {
+                    let Some(background) = self
+                        .rows()
+                        .side(row, column)
+                        .and_then(|side| line_background(side.origin, self.mode))
+                    else {
                         continue;
                     };
                     let band = Bounds::new(
@@ -604,10 +766,10 @@ impl DiffBody {
         let left = cell_bounds.origin.x - px(self.rows().code_left());
         let top = cell_bounds.origin.y;
         let muted = self.theme.muted_foreground;
-        let (origin, marker_left) = match self.rows() {
+
+        match self.rows() {
             Rows::Unified(rows) => {
                 let Row::Line {
-                    origin,
                     old_number,
                     new_number,
                     ..
@@ -633,7 +795,6 @@ impl DiffBody {
                     window,
                     cx,
                 );
-                (origin, left + px(2. * GUTTER_WIDTH + MARKER_PADDING))
             }
             Rows::Split(_) => {
                 let Some(side) = self.rows().side(row, column) else {
@@ -648,13 +809,105 @@ impl DiffBody {
                     window,
                     cx,
                 );
-                (side.origin, left + px(GUTTER_WIDTH + MARKER_PADDING))
             }
+        }
+    }
+
+    fn paint_header(
+        &self,
+        header: &Row,
+        bounds: Bounds<Pixels>,
+        top: Pixels,
+        pen: &Pen,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Row::FileHeader {
+            status,
+            added,
+            deleted,
+            collapsed,
+            ..
+        } = header
+        else {
+            return;
         };
 
-        let marker_color = line_colors(origin, self.mode, &self.theme).foreground;
-        let line = pen.shape(marker(origin).into(), marker_color, window);
-        paint_line(&line, point(marker_left, top), window, cx);
+        let frame = self.header_frame(bounds);
+        let chevron = pen.shape(
+            disclosure(*collapsed).into(),
+            self.theme.muted_foreground,
+            window,
+        );
+        paint_line(
+            &chevron,
+            point(frame.origin.x + px(HEADER_PADDING), top),
+            window,
+            cx,
+        );
+
+        window.paint_quad(
+            fill(
+                Bounds::new(
+                    point(frame.origin.x + px(PASTILLE_LEFT), top + px(PASTILLE_TOP)),
+                    size(px(PASTILLE_SIZE), px(PASTILLE_SIZE)),
+                ),
+                status_color(status, &self.theme),
+            )
+            .corner_radii(px(PASTILLE_RADIUS)),
+        );
+
+        let count = pen.bold(
+            (added + deleted).to_string().into(),
+            self.theme.foreground,
+            window,
+        );
+        let count_right = count_right_edge(frame.right());
+        paint_line(&count, point(count_right - count.width(), top), window, cx);
+
+        let Some(bar) = bar_widths(*added, *deleted, self.content.max_changes) else {
+            return;
+        };
+        let bar_right = bar_right_edge(frame.right(), count.width());
+        let bar_left = bar_right - px(bar.added + bar.deleted);
+        let bar_top = top + px(BAR_TOP);
+        for (offset, width, color) in [
+            (0., bar.added, self.theme.green),
+            (bar.added, bar.deleted, self.theme.red),
+        ] {
+            if width <= 0. {
+                continue;
+            }
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(bar_left + px(offset), bar_top),
+                    size(px(width), px(BAR_HEIGHT)),
+                ),
+                color,
+            ));
+        }
+    }
+
+    fn on_mouse_down(&self, bounds: Bounds<Pixels>, hitbox: &Hitbox, window: &mut Window) {
+        let hitbox = hitbox.clone();
+        let content = Rc::clone(&self.content);
+        let toggle_file = Rc::clone(&self.toggle_file);
+        let origin_y = bounds.origin.y;
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble
+                || event.button != MouseButton::Left
+                || event.click_count != 1
+                || !hitbox.is_hovered(window)
+            {
+                return;
+            }
+            let Some(row) = row_at(origin_y, event.position.y, content.rows.len()) else {
+                return;
+            };
+            if let Some(file) = content.rows.file_at(row) {
+                toggle_file(&file, window, cx);
+            }
+        });
     }
 }
 
@@ -686,16 +939,18 @@ impl Element for DiffBody {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         self.visible = self.visible_rows();
+        self.path_budget = header_budget(self.scroll.bounds().size.width);
+
+        let pen = Pen::new(window);
+        let display: Vec<SharedString> = self
+            .visible_cells()
+            .map(|cell| self.cell_string(cell, &pen, window))
+            .collect();
+        self.display = display;
         self.texts = self
             .visible_cells()
-            .map(|cell| {
-                styled_cell(
-                    self.rows(),
-                    cell,
-                    self.content.strings[cell].clone(),
-                    &self.theme,
-                )
-            })
+            .zip(&self.display)
+            .map(|(cell, text)| styled_cell(self.rows(), cell, text.clone(), &self.theme))
             .collect();
 
         let children: Vec<LayoutId> = self
@@ -755,10 +1010,12 @@ impl Element for DiffBody {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
+        hitbox: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.on_mouse_down(bounds, hitbox, window);
+
         let first_cell = self.visible_cells().start;
         let runs: Vec<TextSelectionRun> = self
             .texts
@@ -767,7 +1024,7 @@ impl Element for DiffBody {
             .map(|(offset, text)| {
                 let cell = first_cell + offset;
                 TextSelectionRun::new(
-                    self.content.strings[cell].clone(),
+                    self.display[offset].clone(),
                     text.layout().clone(),
                     self.cell_bounds[offset],
                 )
@@ -789,7 +1046,7 @@ impl Element for DiffBody {
                 let cell_offset = offset * columns + column;
                 let cell_bounds = self.cell_bounds[cell_offset];
                 let range = if self.select_all {
-                    Some(0..self.content.strings[first_cell + cell_offset].len())
+                    Some(0..self.display[cell_offset].len())
                 } else {
                     projection.ranges().get(cell_offset).and_then(Clone::clone)
                 };
@@ -802,7 +1059,13 @@ impl Element for DiffBody {
                     );
                 }
 
-                self.paint_gutter(row, column, cell_bounds, &pen, window, cx);
+                match self.rows().full(row) {
+                    Some(header @ Row::FileHeader { .. }) if column == 0 => {
+                        self.paint_header(header, bounds, top, &pen, window, cx);
+                    }
+                    Some(Row::FileHeader { .. }) => {}
+                    _ => self.paint_gutter(row, column, cell_bounds, &pen, window, cx),
+                }
                 self.texts[cell_offset].paint(
                     None,
                     None,
@@ -820,20 +1083,16 @@ impl Element for DiffBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::FileStatus;
+    use domain::LineOrigin;
 
     fn file_header() -> Row {
         Row::FileHeader {
+            index: 0,
             path: "src/main.rs".to_string(),
             status: FileStatus::Modified,
             added: 3,
             deleted: 1,
-        }
-    }
-
-    fn hunk_header() -> Row {
-        Row::HunkHeader {
-            text: "@@ -1,3 +1,4 @@".to_string(),
+            collapsed: false,
         }
     }
 
@@ -856,7 +1115,7 @@ mod tests {
 
     fn split_rows() -> Rows {
         Rows::Split(vec![
-            SplitRow::Full(hunk_header()),
+            SplitRow::Full(file_header()),
             SplitRow::Sides {
                 left: Some(side(LineOrigin::Deletion, "gone")),
                 right: None,
@@ -876,6 +1135,14 @@ mod tests {
         assert_eq!(split.columns(), 2);
         assert_eq!(split.cells(), 4);
         assert_eq!(split.code_left(), SPLIT_CODE_LEFT);
+    }
+
+    #[test]
+    fn code_starts_immediately_after_the_gutters_a_view_has() {
+        let unified = Rows::Unified(vec![file_header()]);
+
+        assert_eq!(unified.code_left(), 2. * GUTTER_WIDTH);
+        assert_eq!(split_rows().code_left(), GUTTER_WIDTH);
     }
 
     #[test]
@@ -903,15 +1170,29 @@ mod tests {
     }
 
     #[test]
+    fn only_a_file_header_row_names_a_file() {
+        let unified = Rows::Unified(vec![
+            file_header(),
+            Row::Separator,
+            line(LineOrigin::Context, "keep"),
+        ]);
+
+        assert_eq!(unified.file_at(0), Some(0));
+        assert_eq!(unified.file_at(1), None);
+        assert_eq!(unified.file_at(2), None);
+        assert_eq!(unified.file_at(3), None, "there is no fourth row");
+        assert_eq!(split_rows().file_at(0), Some(0));
+        assert_eq!(
+            split_rows().file_at(1),
+            None,
+            "a two-sided row is never a header"
+        );
+    }
+
+    #[test]
     fn a_row_renders_its_own_kind_of_text() {
-        assert_eq!(
-            row_text(&file_header()),
-            SharedString::from("src/main.rs  +3 \u{2212}1")
-        );
-        assert_eq!(
-            row_text(&hunk_header()),
-            SharedString::from("@@ -1,3 +1,4 @@")
-        );
+        assert_eq!(row_text(&file_header()), SharedString::from("src/main.rs"));
+        assert_eq!(row_text(&Row::Separator), SharedString::default());
         assert_eq!(
             row_text(&line(LineOrigin::Addition, "let x = 1;")),
             SharedString::from("let x = 1;")
@@ -927,18 +1208,259 @@ mod tests {
     #[test]
     fn a_unified_cell_is_its_row() {
         let rows = Rows::Unified(vec![file_header(), line(LineOrigin::Deletion, "gone")]);
-        assert_eq!(
-            cell_text(&rows, 0),
-            SharedString::from("src/main.rs  +3 \u{2212}1")
-        );
+        assert_eq!(cell_text(&rows, 0), SharedString::from("src/main.rs"));
         assert_eq!(cell_text(&rows, 1), SharedString::from("gone"));
     }
 
     #[test]
     fn a_full_width_split_row_renders_in_the_first_column_and_blank_in_the_second() {
         let rows = split_rows();
-        assert_eq!(cell_text(&rows, 0), SharedString::from("@@ -1,3 +1,4 @@"));
+        assert_eq!(cell_text(&rows, 0), SharedString::from("src/main.rs"));
         assert_eq!(cell_text(&rows, 1), SharedString::default());
+    }
+
+    #[test]
+    fn a_separator_carries_no_text_in_either_view() {
+        let unified = Rows::Unified(vec![Row::Separator]);
+        let split = Rows::Split(vec![SplitRow::Full(Row::Separator)]);
+
+        assert_eq!(cell_text(&unified, 0), SharedString::default());
+        assert_eq!(cell_text(&split, 0), SharedString::default());
+        assert_eq!(cell_text(&split, 1), SharedString::default());
+    }
+
+    #[test]
+    fn a_header_starts_at_the_left_edge_and_every_other_row_past_its_gutters() {
+        let unified = Rows::Unified(vec![file_header(), line(LineOrigin::Context, "keep")]);
+        let split = split_rows();
+
+        assert_eq!(unified.cell_left(0), HEADER_TEXT_LEFT);
+        assert_eq!(unified.cell_left(1), CODE_LEFT);
+        assert_eq!(split.cell_left(0), HEADER_TEXT_LEFT);
+        assert_eq!(split.cell_left(1), SPLIT_CODE_LEFT);
+        assert!(
+            split.cell_left(0) < split.cell_left(1),
+            "a header is flush left, ahead of the narrowest code column"
+        );
+    }
+
+    fn monospace(text: &str) -> f32 {
+        text.chars().count() as f32
+    }
+
+    #[test]
+    fn a_path_that_fits_its_budget_is_left_alone() {
+        assert_eq!(elide_path("src/main.rs", 40., monospace), None);
+        assert_eq!(
+            elide_path("0123456789", 10., monospace),
+            None,
+            "a path exactly as wide as its budget still fits"
+        );
+        assert_eq!(elide_path("", 0., monospace), None);
+    }
+
+    #[test]
+    fn a_path_over_its_budget_loses_its_head_rather_than_its_tail() {
+        assert_eq!(
+            elide_path("crates/ui/src/detail.rs", 10., monospace),
+            Some("\u{2026}detail.rs".to_string()),
+            "the tail identifies the file, so the ellipsis leads"
+        );
+        assert_eq!(
+            elide_path("0123456789", 9.9, monospace),
+            Some("\u{2026}23456789".to_string()),
+            "one character over budget drops two, since the ellipsis takes one"
+        );
+        assert_eq!(
+            elide_path("d\u{e9}tail.rs", 5., monospace),
+            Some("\u{2026}l.rs".to_string()),
+            "the cut is a byte offset that lands on a character boundary, not a char count"
+        );
+    }
+
+    #[test]
+    fn an_elided_path_never_exceeds_the_budget_it_was_given() {
+        for path in [
+            "crates/ui/src/detail/diff/body.rs",
+            "crates/ui/src/d\u{e9}tail/diff/b\u{f4}dy.rs",
+        ] {
+            for budget in 2..=40 {
+                let budget = budget as f32;
+                let elided =
+                    elide_path(path, budget, monospace).unwrap_or_else(|| path.to_string());
+                assert!(
+                    monospace(&elided) <= budget,
+                    "{elided:?} overruns a budget of {budget}"
+                );
+                assert!(
+                    path.ends_with(elided.trim_start_matches(ELLIPSIS)),
+                    "{elided:?} is not a tail of {path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_budget_too_small_for_the_ellipsis_itself_keeps_the_ellipsis() {
+        assert_eq!(
+            elide_path("src/main.rs", 0.5, monospace),
+            Some(ELLIPSIS.to_string()),
+            "nothing fits, so the row says so rather than drawing a misleading tail"
+        );
+        assert_eq!(
+            elide_path("src/main.rs", 1., monospace),
+            Some(ELLIPSIS.to_string())
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_viewport_has_no_budget_and_a_narrow_one_has_no_negative_budget() {
+        assert_eq!(header_budget(px(0.)), None);
+        assert_eq!(header_budget(px(-10.)), None);
+        assert_eq!(header_budget(px(1.)), Some(px(0.)));
+        let wide = header_budget(px(1000.)).expect("a measured viewport has a budget");
+        let narrow = header_budget(px(600.)).expect("a measured viewport has a budget");
+        assert_eq!(wide - narrow, px(400.), "the furniture is a fixed width");
+        assert!(narrow > px(0.));
+    }
+
+    #[test]
+    fn the_path_budget_stops_a_gap_short_of_the_leftmost_bar_the_painter_can_draw() {
+        let width = px(1000.);
+        let budget = header_budget(width).expect("a measured viewport has a budget");
+        let path_right = px(HEADER_TEXT_LEFT) + budget;
+
+        assert_eq!(
+            bar_right_edge(width, px(0.)) - px(BAR_WIDTH) - path_right,
+            px(BAR_GAP),
+            "the budget and the painter derive the same clearance from the same constants"
+        );
+        assert_eq!(
+            bar_right_edge(width, px(COUNT_WIDTH + BAR_GAP)) - px(BAR_WIDTH) - path_right,
+            px(0.),
+            "a count wider than its column eats the gap before it reaches the path"
+        );
+    }
+
+    #[test]
+    fn a_bar_is_the_files_share_of_the_widest_one_in_the_patch() {
+        assert_eq!(
+            bar_widths(30, 10, 40),
+            Some(Bar {
+                added: BAR_WIDTH * 0.75,
+                deleted: BAR_WIDTH * 0.25
+            }),
+            "the widest file fills the bar and splits it by its own two counts"
+        );
+        let half = bar_widths(10, 10, 40).expect("a changed file has a bar");
+        assert_eq!(half.added + half.deleted, BAR_WIDTH / 2.);
+        assert_eq!(half.added, half.deleted);
+    }
+
+    #[test]
+    fn a_patch_that_changes_nothing_draws_no_bar_and_divides_by_nothing() {
+        assert_eq!(bar_widths(0, 0, 0), None);
+        assert_eq!(
+            bar_widths(0, 0, 40),
+            None,
+            "a pure rename beside real changes is a bar of no length"
+        );
+    }
+
+    #[test]
+    fn a_file_of_one_kind_of_change_gets_one_segment_and_no_other() {
+        assert_eq!(
+            bar_widths(40, 0, 40),
+            Some(Bar {
+                added: BAR_WIDTH,
+                deleted: 0.
+            })
+        );
+        assert_eq!(
+            bar_widths(0, 40, 40),
+            Some(Bar {
+                added: 0.,
+                deleted: BAR_WIDTH
+            })
+        );
+    }
+
+    #[test]
+    fn a_bar_too_short_to_draw_is_widened_rather_than_lost() {
+        let one = bar_widths(1, 0, 1000).expect("one change still draws");
+        assert_eq!(one.added, BAR_MIN_WIDTH);
+        assert_eq!(one.deleted, 0.);
+
+        let pair = bar_widths(1, 1, 1000).expect("two changes still draw");
+        assert_eq!(pair.added, BAR_MIN_SEGMENT);
+        assert_eq!(pair.deleted, BAR_MIN_SEGMENT);
+    }
+
+    #[test]
+    fn a_segment_too_thin_to_see_keeps_its_minimum_without_lengthening_the_bar() {
+        let lopsided = bar_widths(1, 999, 1000).expect("a changed file has a bar");
+        assert_eq!(lopsided.added, BAR_MIN_SEGMENT);
+        assert_eq!(lopsided.added + lopsided.deleted, BAR_WIDTH);
+
+        let mirrored = bar_widths(999, 1, 1000).expect("a changed file has a bar");
+        assert_eq!(mirrored.deleted, BAR_MIN_SEGMENT);
+        assert_eq!(mirrored.added + mirrored.deleted, BAR_WIDTH);
+    }
+
+    #[test]
+    fn a_pastille_tells_an_addition_a_deletion_and_a_modification_apart() {
+        for theme in [ThemeColor::light(), ThemeColor::dark()] {
+            let colors = [
+                status_color(&FileStatus::Added, &theme),
+                status_color(&FileStatus::Deleted, &theme),
+                status_color(&FileStatus::Modified, &theme),
+            ];
+            for (i, a) in colors.iter().enumerate() {
+                for (j, b) in colors.iter().enumerate().skip(i + 1) {
+                    let distance = crate::theme_palette::rendered_distance(theme.secondary, *a, *b);
+                    assert!(
+                        distance > 0.06,
+                        "statuses {i} and {j} read as the same pastille (distance {distance:.3})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_move_and_a_type_change_share_one_pastille() {
+        let theme = ThemeColor::light();
+        let moved = status_color(&FileStatus::Renamed { similarity: 90 }, &theme);
+        assert_eq!(
+            status_color(&FileStatus::Copied { similarity: 90 }, &theme),
+            moved
+        );
+        assert_eq!(status_color(&FileStatus::TypeChanged, &theme), moved);
+        assert_ne!(moved, status_color(&FileStatus::Modified, &theme));
+    }
+
+    #[test]
+    fn a_disclosure_marker_turns_sideways_when_its_file_is_collapsed() {
+        assert_eq!(disclosure(false), "\u{25be}");
+        assert_eq!(disclosure(true), "\u{25b8}");
+    }
+
+    #[test]
+    fn a_collapsed_header_reads_exactly_as_an_expanded_one() {
+        let collapsed = Row::FileHeader {
+            index: 0,
+            path: "src/main.rs".to_string(),
+            status: FileStatus::Modified,
+            added: 3,
+            deleted: 1,
+            collapsed: true,
+        };
+
+        assert_eq!(
+            row_text(&collapsed),
+            row_text(&file_header()),
+            "the chevron is painted beside the path, so no run and no copy can carry it"
+        );
     }
 
     #[test]
@@ -949,14 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn a_marker_names_the_origin_and_a_context_line_keeps_the_column_wide() {
-        assert_eq!(marker(LineOrigin::Addition), "+");
-        assert_eq!(marker(LineOrigin::Deletion), "\u{2212}");
-        assert_eq!(marker(LineOrigin::Context), " ");
-    }
-
-    #[test]
-    fn only_a_changed_line_and_the_two_headers_are_banded() {
+    fn only_a_changed_line_the_file_header_and_a_separator_are_banded() {
         let theme = ThemeColor::light();
         let mode = ThemeMode::Light;
 
@@ -965,7 +1480,7 @@ mod tests {
             Some(theme.secondary)
         );
         assert_eq!(
-            row_background(&hunk_header(), &theme, mode),
+            row_background(&Row::Separator, &theme, mode),
             Some(theme.muted)
         );
         assert_eq!(
@@ -984,7 +1499,7 @@ mod tests {
         );
         assert_eq!(
             row_background(&line(LineOrigin::Addition, "new"), &theme, mode),
-            line_colors(LineOrigin::Addition, mode, &theme).background
+            line_background(LineOrigin::Addition, mode)
         );
     }
 
@@ -1003,23 +1518,31 @@ mod tests {
         let bounds = Bounds::new(point(px(10.), px(20.)), size(px(200.), px(400.)));
 
         assert_eq!(
-            bounds_for_cell(bounds, 2, px(60.), 3),
+            bounds_for_cell(bounds, 2, px(SPLIT_CODE_LEFT), 3),
             Bounds::new(
-                point(px(170.), px(20. + ROW_HEIGHT)),
-                size(px(40.), px(ROW_HEIGHT))
+                point(px(110. + SPLIT_CODE_LEFT), px(20. + ROW_HEIGHT)),
+                size(px(100. - SPLIT_CODE_LEFT), px(ROW_HEIGHT))
             ),
             "cell 3 is the right column of the second row"
         );
         assert_eq!(
-            bounds_for_cell(bounds, 1, px(104.), 0),
-            Bounds::new(point(px(114.), px(20.)), size(px(96.), px(ROW_HEIGHT)))
+            bounds_for_cell(bounds, 1, px(CODE_LEFT), 0),
+            Bounds::new(
+                point(px(10. + CODE_LEFT), px(20.)),
+                size(px(200. - CODE_LEFT), px(ROW_HEIGHT))
+            )
         );
     }
 
     #[test]
     fn a_column_narrower_than_its_gutters_leaves_no_width_rather_than_a_negative_one() {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(80.), px(400.)));
-        assert_eq!(bounds_for_cell(bounds, 2, px(60.), 0).size.width, px(0.));
+        assert_eq!(
+            bounds_for_cell(bounds, 2, px(SPLIT_CODE_LEFT), 0)
+                .size
+                .width,
+            px(0.)
+        );
     }
 
     #[test]
@@ -1142,6 +1665,21 @@ mod tests {
             row_window(px(-900. * ROW_HEIGHT), px(10. * ROW_HEIGHT), 500),
             500..500
         );
+    }
+
+    #[test]
+    fn a_click_lands_on_the_row_its_height_puts_it_in() {
+        assert_eq!(row_at(px(100.), px(100.), 3), Some(0));
+        assert_eq!(row_at(px(100.), px(100. + ROW_HEIGHT - 1.), 3), Some(0));
+        assert_eq!(row_at(px(100.), px(100. + ROW_HEIGHT), 3), Some(1));
+        assert_eq!(row_at(px(100.), px(100. + 2.5 * ROW_HEIGHT), 3), Some(2));
+    }
+
+    #[test]
+    fn a_click_outside_the_rows_lands_on_none_of_them() {
+        assert_eq!(row_at(px(100.), px(99.), 3), None);
+        assert_eq!(row_at(px(100.), px(100. + 3. * ROW_HEIGHT), 3), None);
+        assert_eq!(row_at(px(100.), px(100.), 0), None);
     }
 
     #[test]

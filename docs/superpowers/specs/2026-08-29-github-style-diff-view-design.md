@@ -70,10 +70,23 @@ every row's wrapped height depends on the viewport width and has to be computed 
 anything can be placed. The choice stands on fidelity and on that cost, and can be
 revisited without invalidating the rest of this design.
 
-**The `+`/`-` marker stays, in a column of its own.** Sixteen pixels, between the gutters
-and the code, as in the deleted renderer. It no longer shifts the code, it carries the
-signal for anyone who reads the green and the red poorly, and being a separate element it
-never reaches the clipboard.
+**The `+`/`-` marker goes, column and all.** This reverses the original decision, which was
+to keep it in sixteen pixels of its own between the gutters and the code, on the grounds
+that it carried the signal for anyone who reads the green and the red poorly. That argument
+was made against a mock-up. Seen running, the full-width row tint — the thing this whole
+design exists to make possible, and the thing the editor could not draw — turned out to
+carry the signal on its own, and the marker read as leftover furniture between the line
+numbers and the code. So `MARKER_WIDTH`, `MARKER_PADDING` and the glyph itself are deleted
+rather than blanked, and `code_left()` is now the gutters alone: `2 × GUTTER_WIDTH` unified,
+`GUTTER_WIDTH` split. The code gains the sixteen pixels.
+
+The accessibility argument is not answered, only outweighed, and it is the reason to record
+this rather than to drop the bullet. If it is ever revisited, the cheapest mitigation is not
+to put the character back: it is a 2px coloured edge down the left of the row, inside the
+tint. That makes *shape* carry the information — which is what the marker was really for —
+without returning a glyph to the text, so it stays out of every run and every clipboard and
+costs the code no width. `palette::line_background` is where the per-origin colour it would
+need used to live.
 
 **The domain layer does not change.** `DiffLine` already stores `old_number`, `new_number`,
 and a `content` with the marker stripped (`crates/domain/src/patch.rs:27`, parser at
@@ -150,9 +163,9 @@ in `prepaint`/`paint`:
   difference of the two origins keeps the sum identical by construction and puts the trigger
   zone where the user can reach it.
 - `TextSelectionRun::new(text, layout, bounds)` — **only for the code content**. The
-  gutters and the marker are neighbouring elements and are never registered, which is what
-  makes a copied diff come out as clean code with no line numbers and no markers. This is
-  strictly better than the editor, which copies its markers today.
+  gutters are painted directly and are never registered, which is what makes a copied diff
+  come out as clean code with no line numbers. This is strictly better than the editor,
+  which copies its markers today.
 - `TextSelectionContentKey` turns out not to be needed. It is a `u64` the participant
   computes from an endpoint's content point through
   `TextSelectionHandle::resolve_content_key_with`, which `gpui-base` stores on the endpoint

@@ -1,20 +1,18 @@
-use std::fmt::Write as _;
-
 use domain::{DiffLine, FilePatch, FileStatus, Hunk, LineOrigin, Patch};
 
-use crate::detail::format;
+use super::Collapsed;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Row {
     FileHeader {
+        index: usize,
         path: String,
         status: FileStatus,
         added: usize,
         deleted: usize,
+        collapsed: bool,
     },
-    HunkHeader {
-        text: String,
-    },
+    Separator,
     Line {
         origin: LineOrigin,
         old_number: Option<u32>,
@@ -26,31 +24,36 @@ pub(super) enum Row {
     },
 }
 
-pub(super) fn rows(patch: &Patch) -> Vec<Row> {
+pub(super) fn rows(patch: &Patch, collapsed: &Collapsed) -> Vec<Row> {
     let mut rows = Vec::new();
-    for file in &patch.files {
-        rows.push(file_header(file));
-        push_body(&mut rows, file);
+    for (index, file) in patch.files.iter().enumerate() {
+        let is_collapsed = collapsed.contains(&index);
+        rows.push(file_header(index, file, is_collapsed));
+        if !is_collapsed {
+            push_body(&mut rows, file);
+        }
     }
     rows
 }
 
-pub(super) fn file_header(file: &FilePatch) -> Row {
+pub(super) fn file_header(index: usize, file: &FilePatch, collapsed: bool) -> Row {
     Row::FileHeader {
+        index,
         path: header_path(file),
         status: file.status.clone(),
         added: file.added_lines(),
         deleted: file.deleted_lines(),
+        collapsed,
     }
 }
 
-pub(super) fn header_line(path: &str, status: &FileStatus, added: usize, deleted: usize) -> String {
-    let mut text = path.to_string();
-    if let Some(label) = status_label(status) {
-        let _ = write!(text, "  {label}");
-    }
-    let _ = write!(text, "  +{added} \u{2212}{deleted}");
-    text
+pub(super) fn max_changes(patch: &Patch) -> usize {
+    patch
+        .files
+        .iter()
+        .map(|file| file.added_lines() + file.deleted_lines())
+        .max()
+        .unwrap_or(0)
 }
 
 fn header_path(file: &FilePatch) -> String {
@@ -69,15 +72,8 @@ fn header_path(file: &FilePatch) -> String {
     }
 }
 
-fn status_label(status: &FileStatus) -> Option<String> {
-    match status {
-        FileStatus::Modified => None,
-        FileStatus::Added => Some("added".to_string()),
-        FileStatus::Deleted => Some("deleted".to_string()),
-        FileStatus::Renamed { similarity } => Some(format!("renamed {similarity}%")),
-        FileStatus::Copied { similarity } => Some(format!("copied {similarity}%")),
-        FileStatus::TypeChanged => Some("type changed".to_string()),
-    }
+pub(super) fn filled_hunks(file: &FilePatch) -> impl Iterator<Item = &Hunk> {
+    file.hunks.iter().filter(|hunk| !hunk.lines.is_empty())
 }
 
 pub(super) fn placeholder(file: &FilePatch) -> Option<Row> {
@@ -94,19 +90,15 @@ pub(super) fn placeholder(file: &FilePatch) -> Option<Row> {
     None
 }
 
-pub(super) fn hunk_header(hunk: &Hunk) -> Row {
-    Row::HunkHeader {
-        text: format::hunk_heading(hunk),
-    }
-}
-
 fn push_body(rows: &mut Vec<Row>, file: &FilePatch) {
     if let Some(placeholder) = placeholder(file) {
         rows.push(placeholder);
         return;
     }
-    for hunk in &file.hunks {
-        rows.push(hunk_header(hunk));
+    for (position, hunk) in filled_hunks(file).enumerate() {
+        if position > 0 {
+            rows.push(Row::Separator);
+        }
         rows.extend(hunk.lines.iter().map(line_row));
     }
 }
@@ -166,8 +158,20 @@ mod tests {
         }
     }
 
+    fn expanded() -> Collapsed {
+        Collapsed::new()
+    }
+
+    fn collapsed(files: impl IntoIterator<Item = usize>) -> Collapsed {
+        files.into_iter().collect()
+    }
+
+    fn one_line() -> Hunk {
+        hunk(vec![line(LineOrigin::Addition, None, Some(1), "new")])
+    }
+
     #[test]
-    fn a_modified_file_yields_a_header_a_hunk_header_and_one_row_per_line() {
+    fn a_modified_file_yields_a_header_and_one_row_per_line() {
         let patch = Patch {
             files: vec![file(
                 vec![hunk(vec![
@@ -179,11 +183,11 @@ mod tests {
             )],
         };
 
-        let rows = rows(&patch);
+        let rows = rows(&patch, &expanded());
 
         assert!(matches!(rows[0], Row::FileHeader { .. }));
-        assert!(matches!(rows[1], Row::HunkHeader { .. }));
-        assert_eq!(rows.len(), 5);
+        assert!(matches!(rows[1], Row::Line { .. }));
+        assert_eq!(rows.len(), 4);
     }
 
     #[test]
@@ -200,10 +204,10 @@ mod tests {
             )],
         };
 
-        let rows = rows(&patch);
+        let rows = rows(&patch, &expanded());
 
         assert_eq!(
-            rows[2],
+            rows[1],
             Row::Line {
                 origin: LineOrigin::Deletion,
                 old_number: Some(7),
@@ -219,7 +223,7 @@ mod tests {
         let patch = Patch {
             files: vec![file(Vec::new(), true)],
         };
-        let rows = rows(&patch);
+        let rows = rows(&patch, &expanded());
         assert_eq!(
             rows[1],
             Row::Placeholder {
@@ -233,7 +237,7 @@ mod tests {
         let patch = Patch {
             files: vec![file(Vec::new(), false)],
         };
-        let rows = rows(&patch);
+        let rows = rows(&patch, &expanded());
         assert_eq!(
             rows[1],
             Row::Placeholder {
@@ -249,22 +253,15 @@ mod tests {
             "src/new.rs",
             FileStatus::Renamed { similarity: 87 },
         );
-        let Row::FileHeader {
-            path,
-            status,
-            added,
-            deleted,
-        } = file_header(&file)
-        else {
+        let Row::FileHeader { path, status, .. } = file_header(0, &file, false) else {
             panic!("a file yields a header row");
         };
 
-        assert_eq!(path, "src/old.rs \u{2192} src/new.rs");
-        assert_eq!(status, FileStatus::Renamed { similarity: 87 });
         assert_eq!(
-            header_line(&path, &status, added, deleted),
-            "src/old.rs \u{2192} src/new.rs  renamed 87%  +0 \u{2212}0"
+            path, "src/old.rs \u{2192} src/new.rs",
+            "the similarity rides on the status, which is painted as a pastille"
         );
+        assert_eq!(status, FileStatus::Renamed { similarity: 87 });
     }
 
     #[test]
@@ -274,21 +271,12 @@ mod tests {
             "src/copy.rs",
             FileStatus::Copied { similarity: 100 },
         );
-        let Row::FileHeader {
-            path,
-            status,
-            added,
-            deleted,
-        } = file_header(&file)
-        else {
+        let Row::FileHeader { path, status, .. } = file_header(0, &file, false) else {
             panic!("a file yields a header row");
         };
 
         assert_eq!(path, "src/old.rs \u{2192} src/copy.rs");
-        assert_eq!(
-            header_line(&path, &status, added, deleted),
-            "src/old.rs \u{2192} src/copy.rs  copied 100%  +0 \u{2212}0"
-        );
+        assert_eq!(status, FileStatus::Copied { similarity: 100 });
     }
 
     #[test]
@@ -298,33 +286,32 @@ mod tests {
             "src/a.rs",
             FileStatus::Renamed { similarity: 100 },
         );
-        let Row::FileHeader { path, .. } = file_header(&file) else {
+        let Row::FileHeader { path, .. } = file_header(0, &file, false) else {
             panic!("a file yields a header row");
         };
         assert_eq!(path, "src/a.rs");
     }
 
     #[test]
-    fn a_modified_file_carries_no_status_label() {
+    fn a_header_carries_the_path_and_nothing_else() {
         let patch = Patch {
-            files: vec![file(
-                vec![hunk(vec![line(LineOrigin::Addition, None, Some(1), "new")])],
-                false,
-            )],
+            files: vec![file(vec![one_line()], false)],
         };
         let Row::FileHeader {
             path,
-            status,
             added,
             deleted,
-        } = rows(&patch).remove(0)
+            ..
+        } = rows(&patch, &expanded()).remove(0)
         else {
             panic!("the first row is the file header");
         };
 
+        assert_eq!(added, 1);
+        assert_eq!(deleted, 0);
         assert_eq!(
-            header_line(&path, &status, added, deleted),
-            "src/main.rs  +1 \u{2212}0"
+            path, "src/main.rs",
+            "the counts are painted, so a run cannot copy them with the path"
         );
     }
 
@@ -333,10 +320,167 @@ mod tests {
         let patch = Patch {
             files: vec![file(Vec::new(), true), file(Vec::new(), true)],
         };
-        let headers = rows(&patch)
+        let headers = rows(&patch, &expanded())
             .iter()
             .filter(|r| matches!(r, Row::FileHeader { .. }))
             .count();
         assert_eq!(headers, 2);
+    }
+
+    #[test]
+    fn a_separator_stands_between_two_hunks_and_never_ahead_of_the_first() {
+        let patch = Patch {
+            files: vec![file(vec![one_line(), one_line()], false)],
+        };
+
+        let rows = rows(&patch, &expanded());
+
+        assert!(matches!(rows[0], Row::FileHeader { .. }));
+        assert!(matches!(rows[1], Row::Line { .. }));
+        assert_eq!(rows[2], Row::Separator);
+        assert!(matches!(rows[3], Row::Line { .. }));
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn a_collapsed_file_emits_its_header_and_nothing_else() {
+        let patch = Patch {
+            files: vec![file(vec![one_line(), one_line()], false)],
+        };
+
+        let rows = rows(&patch, &collapsed([0]));
+
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0],
+            Row::FileHeader {
+                collapsed: true,
+                ..
+            }
+        ));
+        assert!(!rows.contains(&Row::Separator));
+    }
+
+    #[test]
+    fn a_collapsed_binary_file_drops_its_placeholder_too() {
+        let patch = Patch {
+            files: vec![file(Vec::new(), true)],
+        };
+        assert_eq!(rows(&patch, &collapsed([0])).len(), 1);
+    }
+
+    #[test]
+    fn collapsing_one_file_leaves_the_others_whole() {
+        let patch = Patch {
+            files: vec![
+                file(vec![one_line()], false),
+                file(vec![one_line()], false),
+                file(vec![one_line()], false),
+            ],
+        };
+
+        let rows = rows(&patch, &collapsed([1]));
+
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(
+            rows[0],
+            Row::FileHeader {
+                index: 0,
+                collapsed: false,
+                ..
+            }
+        ));
+        assert!(matches!(rows[1], Row::Line { .. }));
+        assert!(matches!(
+            rows[2],
+            Row::FileHeader {
+                index: 1,
+                collapsed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rows[3],
+            Row::FileHeader {
+                index: 2,
+                collapsed: false,
+                ..
+            }
+        ));
+        assert!(matches!(rows[4], Row::Line { .. }));
+    }
+
+    #[test]
+    fn a_collapsed_header_carries_the_flag_and_reads_exactly_as_an_expanded_one() {
+        let file = file(vec![one_line()], false);
+        let Row::FileHeader {
+            path, collapsed, ..
+        } = file_header(0, &file, true)
+        else {
+            panic!("a file yields a header row");
+        };
+
+        assert!(collapsed);
+        assert_eq!(
+            path, "src/main.rs",
+            "the disclosure chevron is painted, because a run would copy it"
+        );
+    }
+
+    #[test]
+    fn the_scale_is_the_largest_file_of_the_patch() {
+        let patch = Patch {
+            files: vec![
+                file(vec![one_line()], false),
+                file(
+                    vec![hunk(vec![
+                        line(LineOrigin::Addition, None, Some(1), "a"),
+                        line(LineOrigin::Addition, None, Some(2), "b"),
+                        line(LineOrigin::Deletion, Some(1), None, "c"),
+                    ])],
+                    false,
+                ),
+            ],
+        };
+        assert_eq!(max_changes(&patch), 3);
+    }
+
+    #[test]
+    fn a_patch_of_pure_renames_has_no_scale_to_divide_by() {
+        let patch = Patch {
+            files: vec![moved(
+                "src/old.rs",
+                "src/new.rs",
+                FileStatus::Renamed { similarity: 100 },
+            )],
+        };
+        assert_eq!(max_changes(&patch), 0);
+        assert_eq!(max_changes(&Patch::default()), 0);
+    }
+
+    #[test]
+    fn an_empty_hunk_yields_neither_a_line_nor_a_separator() {
+        let patch = Patch {
+            files: vec![file(vec![hunk(Vec::new()), one_line()], false)],
+        };
+
+        let rows = rows(&patch, &expanded());
+
+        assert!(matches!(rows[0], Row::FileHeader { .. }));
+        assert!(matches!(rows[1], Row::Line { .. }));
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_hunk_between_two_filled_ones_parts_them_only_once() {
+        let patch = Patch {
+            files: vec![file(vec![one_line(), hunk(Vec::new()), one_line()], false)],
+        };
+
+        let rows = rows(&patch, &expanded());
+
+        assert_eq!(rows[2], Row::Separator);
+        assert_eq!(rows.iter().filter(|row| **row == Row::Separator).count(), 1);
+        assert_eq!(rows.len(), 4);
     }
 }

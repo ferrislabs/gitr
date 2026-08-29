@@ -7,25 +7,49 @@
 //! full-width row background outside the cursor line, so an addition's tint hugs the glyphs
 //! and a blank added line gets none at all; and it has no per-line element hook to work
 //! around either. The `+`/`-` markers were carrying the signal the colour only half
-//! carried. All three follow from the diff being one text document, so the rows are built
-//! here instead — see the design note under `docs/superpowers/specs/`.
+//! carried; a full-width tint carries it whole, so this view draws no markers at all. All
+//! three follow from the diff being one text document, so the rows are built here instead —
+//! see the design note under `docs/superpowers/specs/`.
 //!
 //! A row carries one cell in [`DiffViewMode::Unified`] and two in [`DiffViewMode::Split`],
 //! which is the only difference between the two views: [`body::Rows`] answers how many
 //! columns a body has, and every horizontal position — the content width, a cell's bounds,
-//! a gutter's origin — is that column's share of the element's width. A file, hunk or
+//! a gutter's origin — is that column's share of the element's width. A file, separator or
 //! placeholder row keeps one full-width cell in either view, so the columns stay uniform
 //! and a cell is `row * columns + column` rather than a lookup. Because a column is laid
 //! out against `content_width / columns` and the width is measured over every cell, a
 //! full-width header still fits in the half it is drawn in.
 //!
+//! A file header is the one row that is not placed that way, because it is the one row that
+//! is not document. The code rows scroll horizontally because they *are* the thing being
+//! read; a header describes what is being read and belongs to the frame around it. So its
+//! chevron, pastille and path pin to the viewport's left edge and its bar and count to the
+//! viewport's right edge, inset by `gpui_component::scroll::Scrollbar::width()` so the count
+//! never sits under the overlay scrollbar. Only the background band still spans the element,
+//! which is what keeps a scrolled header reading as one continuous row rather than as a
+//! label floating over the code. The viewport is unmeasured on the first frame, exactly as
+//! it is for [`body::row_window`], and the fallback has the same shape: for that one frame
+//! the header falls back to the element's own edges and nothing is elided, and the second
+//! frame corrects it.
+//!
+//! Pinning is what bounds the path, and the bound is a single number per frame:
+//! `body::header_budget` is the viewport less the furniture at both ends, computed in
+//! `request_layout` beside the visible range. A path wider than it is elided from the
+//! *left* — `…detail/diff/split.rs` — because the tail of a path is what names the file and
+//! the head is the part that can be lost. The elided string is the one that becomes the run,
+//! so what is highlighted and what is copied still cannot drift apart. The price is the
+//! other half of that trade: copying a header whose path is too long for the panel yields
+//! the elided form, not the whole path.
+//!
 //! Selection comes back through `gpui-base`'s window-level participant system rather than
 //! from the editor. [`body`] is the element that joins it: it registers one participant and
 //! declares one run per cell on screen, left before right within a row, and only the code
-//! text becomes a run — the gutters and the marker are painted directly and never
-//! registered, which is what keeps line numbers and markers out of the clipboard. The rows
-//! scroll on both axes rather than soft-wrapping,
-//! matching GitHub. `restrict_scroll_to_axis` still earns its place here, but not for the
+//! text — or, on a file header, the path alone — becomes a run. Everything else a row draws
+//! is painted directly and never registered: a line's two gutters, and a header's disclosure
+//! chevron, status pastille, change bar and change count. That is what keeps line numbers and
+//! a file's statistics out of the clipboard, and it is why copying a header yields a bare
+//! path. The code rows scroll on both axes rather than soft-wrapping, matching GitHub.
+//! `restrict_scroll_to_axis` still earns its place here, but not for the
 //! reason it usually does: the container's `overflow_scroll()` puts both axes in
 //! `Overflow::Scroll`, and gpui's vertical-onto-horizontal remap (`div.rs:3220-3224`,
 //! `:3229-3233`) only fires when one axis is *not* `Overflow::Scroll`, so that remap is
@@ -56,12 +80,12 @@
 //! projection still agree cell for cell. Endpoints survive scrolling because `gpui-base`
 //! stores them relative to `bounds.origin + scroll_offset`, and the participant reports the
 //! two so that their sum is this element's own origin, which already carries the scroll: a
-//! point off the top of the viewport is then a negative `y` rather than a lost one. Rows
-//! that *are* on screen keep the projection's
-//! own range, so what is highlighted and what is copied cannot drift apart. Select All is
-//! the one selection with no window points to derive anything from — it is participant-local
-//! (`set_local_selection`), so `copy_selection` answers the whole document for it directly
-//! and every visible cell is highlighted whole.
+//! point off the top of the viewport is then a negative `y` rather than a lost one. Rows that
+//! *are* on screen keep both the projection's range and the string it was measured against,
+//! read out of the one `display` array the runs were declared from, so what is highlighted and
+//! what is copied cannot drift apart. Select All is the one selection with no window points to
+//! derive anything from — it is participant-local (`set_local_selection`), so `copy_selection`
+//! answers the whole document for it directly and every visible cell is highlighted whole.
 //!
 //! What stays unwindowed is the content width: `body::DiffBody::content_width` shapes every
 //! cell on every layout pass, because the horizontal scroll extent has to consider rows that
@@ -69,10 +93,22 @@
 //! because a cell is laid out against a column width that provably exceeds every cell's
 //! natural width — which is what keeps a row one line tall and `ROW_HEIGHT` true. That is
 //! affordable only because the text it measures is not rebuilt with it: [`DiffContent`]
-//! holds the rows and one [`gpui::SharedString`] per cell, derived by [`content`] when the
-//! patch or the view mode changes and handed to the element behind an `Rc` thereafter. So
-//! after the first frame each cell is a hit in gpui's line-layout cache and the steady-state
-//! cost is a hash of bytes that are already there, with no allocation and no reshape.
+//! holds the rows, one [`gpui::SharedString`] per cell, and the total changes of the patch's
+//! largest file, derived by [`content`] when the patch, the view mode or the set of collapsed
+//! files changes and handed to the element behind an `Rc` thereafter. So after the first
+//! frame each cell is a hit in gpui's line-layout cache and the steady-state cost is a hash
+//! of bytes that are already there, with no allocation and no reshape. A header row is the
+//! exception in one respect: its elision binary-searches the tail against the shaped width,
+//! so it allocates a handful of candidates per header per frame. They are the same
+//! candidates every frame, so they settle into the same cache, and there are at most a
+//! screenful of headers — but it is a search, not a lookup. The largest file's total changes
+//! is the scale every header's change bar is drawn against, and it belongs to the derivation
+//! for the same reason the strings do: a bar is a share of the widest file in the patch, so
+//! sizing one from the element would mean walking every file of the patch on every frame.
+//! Collapsing is applied in that same derivation — the body rows of a collapsed file are
+//! never emitted — so the element windows, paints and selects over a shorter list and knows
+//! nothing of collapsing beyond mapping a click to a row and drawing a disclosure chevron at
+//! the header's own left edge, which keeps that chevron out of every run and every copy.
 //!
 //! Copying depends on a fact `gpui-base`'s own doc comment does not state. A participant's
 //! runs concatenate with no separator when `update_runs` projects them
@@ -102,12 +138,13 @@ mod pairing;
 mod palette;
 mod split;
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use domain::Patch;
 use gpui::{
-    AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
+    AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_base::TextSelectionHandle;
 use gpui_component::{
@@ -118,27 +155,40 @@ use gpui_component::{
 use crate::diff_view_mode::DiffViewMode;
 
 use body::{ROW_HEIGHT, Rows, body, cell_strings};
-use model::rows;
+use model::{max_changes, rows};
 use split::split_rows;
+
+pub(super) type Collapsed = HashSet<usize>;
+
+pub(super) type ToggleFile = Rc<dyn Fn(&usize, &mut Window, &mut App)>;
 
 pub(super) struct DiffContent {
     rows: Rows,
     strings: Vec<SharedString>,
+    max_changes: usize,
 }
 
 impl DiffContent {
     pub(super) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+
+    pub(super) fn height(&self) -> Pixels {
+        px(self.rows.len() as f32 * ROW_HEIGHT)
+    }
 }
 
-pub(super) fn content(patch: &Patch, mode: DiffViewMode) -> DiffContent {
+pub(super) fn content(patch: &Patch, mode: DiffViewMode, collapsed: &Collapsed) -> DiffContent {
     let rows = match mode {
-        DiffViewMode::Unified => Rows::Unified(rows(patch)),
-        DiffViewMode::Split => Rows::Split(split_rows(patch)),
+        DiffViewMode::Unified => Rows::Unified(rows(patch, collapsed)),
+        DiffViewMode::Split => Rows::Split(split_rows(patch, collapsed)),
     };
     let strings = cell_strings(&rows);
-    DiffContent { rows, strings }
+    DiffContent {
+        rows,
+        strings,
+        max_changes: max_changes(patch),
+    }
 }
 
 pub(super) fn render(
@@ -146,6 +196,7 @@ pub(super) fn render(
     select_all: bool,
     selection: &TextSelectionHandle,
     scroll: &ScrollHandle,
+    toggle_file: ToggleFile,
     cx: &App,
 ) -> AnyElement {
     let Some(content) = content.filter(|content| !content.is_empty()) else {
@@ -178,6 +229,7 @@ pub(super) fn render(
                     select_all,
                     selection.clone(),
                     scroll.clone(),
+                    toggle_file,
                     theme.colors,
                     theme.mode,
                 )),
