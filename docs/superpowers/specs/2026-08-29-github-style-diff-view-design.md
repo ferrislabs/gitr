@@ -137,8 +137,14 @@ The body element registers one participant and declares that frame's visible row
 in `prepaint`/`paint`:
 
 - `TextSelectionRegistration::new(hitbox, bounds)` with `.with_document_order(n)` so a drag
-  across rows copies in document order, and `.with_scroll_offset(..)` so the geometry stays
-  correct under scrolling.
+  across rows copies in document order. `.with_scroll_offset(..)` is **not** called: gpui
+  prepaints scroll children inside `with_element_offset` (`div.rs:1925`), and
+  `Window::layout_bounds` folds that accumulated offset into `bounds.origin`
+  (`window.rs:4697`) — so this element's `bounds.origin` already carries the scroll.
+  `gpui-base` stores a selection endpoint as `position − bounds.origin − scroll_offset`
+  (`text_selection.rs:1336`), so reporting the offset as well double-counts it and the
+  anchor drifts at twice the scroll delta. `with_scroll_offset` is for a participant that
+  scrolls its own content inside fixed bounds, which this element does not do.
 - `TextSelectionRun::new(text, layout, bounds)` — **only for the code content**. The
   gutters and the marker are neighbouring elements and are never registered, which is what
   makes a copied diff come out as clean code with no line numbers and no markers. This is
@@ -222,9 +228,14 @@ than after.
 Second risk: the coordinate handling. `TextLayout::bounds`, `line_height`, `len`,
 `position_for_index` and `index_for_position` all panic when called before the text has been
 laid out — they `unwrap`/`expect` on an inner cell filled during prepaint. They are safe
-from `paint` and from nowhere earlier. Combined with hand-rolled windowing and a scroll
-offset reported through `with_scroll_offset`, this is where an implementation will go wrong
-if it goes wrong.
+from `paint` and from nowhere earlier. This is where hand-rolled windowing bites: `prepaint`
+today lays out every row and `paint` builds a run for every row, which is only safe while
+`prepaint` stays unwindowed. Task 5 narrows `paint` to the visible rows but must not narrow
+`prepaint` to match — doing so would leave the off-screen rows' `TextLayout`s unlaid-out, and
+the first scroll with a live selection would panic on "prepaint has not been performed".
+Narrowing the runs passed to `update_runs` instead avoids the panic but silently truncates a
+copy to whatever rows are on screen, which is just as wrong. This is where an implementation
+will go wrong if it goes wrong.
 
 ## Files touched
 

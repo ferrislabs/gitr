@@ -2311,6 +2311,7 @@ dependencies = [
  "gitr-graph",
  "gitr-vcs",
  "gpui",
+ "gpui-base",
  "gpui-component",
  "serde",
  "serde_json",

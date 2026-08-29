@@ -17,6 +17,7 @@ graph.workspace = true
 vcs.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
+gpui-base.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
