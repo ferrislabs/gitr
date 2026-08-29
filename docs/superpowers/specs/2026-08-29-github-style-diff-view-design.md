@@ -149,8 +149,16 @@ in `prepaint`/`paint`:
   gutters and the marker are neighbouring elements and are never registered, which is what
   makes a copied diff come out as clean code with no line numbers and no markers. This is
   strictly better than the editor, which copies its markers today.
-- `TextSelectionContentKey` gives virtualised rows a stable identity, so a selection
-  survives a row being recycled by the list.
+- `TextSelectionContentKey` turns out not to be needed. It is a `u64` the participant
+  computes from an endpoint's content point through
+  `TextSelectionHandle::resolve_content_key_with`, which `gpui-base` stores on the endpoint
+  and hands straight back on `TextSelectionSnapshot::anchor().content_key()`. It is a
+  channel back to the participant and nothing more: it takes no part in hit-testing, in
+  `project_ranges`, or in copying. What actually makes an off-screen endpoint survive is
+  that the endpoint is stored as `position − bounds.origin` and this element's
+  `bounds.origin` already carries the scroll, so an endpoint above the viewport is a
+  negative `y` rather than a lost one — and a row index here is `y / ROW_HEIGHT`, which is
+  the identity a key would have carried anyway.
 
 The text has to go through `StyledText` rather than `div().child("…")`, because a run needs
 a `TextLayout`. This is the one structural constraint the selection system imposes on the
@@ -228,14 +236,19 @@ than after.
 Second risk: the coordinate handling. `TextLayout::bounds`, `line_height`, `len`,
 `position_for_index` and `index_for_position` all panic when called before the text has been
 laid out — they `unwrap`/`expect` on an inner cell filled during prepaint. They are safe
-from `paint` and from nowhere earlier. This is where hand-rolled windowing bites: `prepaint`
-today lays out every row and `paint` builds a run for every row, which is only safe while
-`prepaint` stays unwindowed. Task 5 narrows `paint` to the visible rows but must not narrow
-`prepaint` to match — doing so would leave the off-screen rows' `TextLayout`s unlaid-out, and
-the first scroll with a live selection would panic on "prepaint has not been performed".
-Narrowing the runs passed to `update_runs` instead avoids the panic but silently truncates a
-copy to whatever rows are on screen, which is just as wrong. This is where an implementation
-will go wrong if it goes wrong.
+from `paint` and from nowhere earlier. This is where hand-rolled windowing bites, and the
+two obvious moves are both wrong. Narrowing layout while keeping a run per row panics on the
+first scroll with a live selection, because `selection_range_for_run` reads `layout.len()` on
+every run it is handed. Narrowing the runs to match avoids the panic and silently truncates a
+copy to whatever rows are on screen.
+
+The way out is that the copy does not have to come from the projection. `update_runs` covers
+the window and drives only the highlight; the copied text is derived from the selection's own
+window points, which are scroll-invariant, so the row span is arithmetic and only the two rows
+whose ends the selection cuts through need shaping at all. A row already on screen keeps the
+projection's range, so the highlight and the clipboard cannot disagree. What stays unwindowed
+is the content-width measurement, which must consider every row or the horizontal scroll
+extent moves as the view scrolls vertically.
 
 ## Files touched
 

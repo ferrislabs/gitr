@@ -10,7 +10,8 @@
 //! Both tabs keep their scroll position in a [`ScrollHandle`] owned here rather than in
 //! the element tree, which is rebuilt every render. The diff's handle is passed down to
 //! the row element as well, because that element reads its own scroll offset to decide
-//! which rows are worth painting.
+//! which rows to lay out and paint — it is the only input it has to that decision before
+//! the frame gives it any bounds.
 //!
 //! The one piece of view state that does need to outlive a frame is the diff's selection
 //! participant: `gpui-base` keys a window-level selection off a

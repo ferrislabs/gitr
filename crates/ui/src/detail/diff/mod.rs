@@ -12,9 +12,9 @@
 //!
 //! Selection comes back through `gpui-base`'s window-level participant system rather than
 //! from the editor. [`body`] is the element that joins it: it registers one participant and
-//! declares one run per row, and only the code text becomes a run — the gutters and the
-//! marker are painted directly and never registered, which is what keeps line numbers and
-//! markers out of the clipboard. The rows scroll on both axes rather than soft-wrapping,
+//! declares one run per row on screen, and only the code text becomes a run — the gutters
+//! and the marker are painted directly and never registered, which is what keeps line
+//! numbers and markers out of the clipboard. The rows scroll on both axes rather than soft-wrapping,
 //! matching GitHub. `restrict_scroll_to_axis` still earns its place here, but not for the
 //! reason it usually does: the container's `overflow_scroll()` puts both axes in
 //! `Overflow::Scroll`, and gpui's vertical-onto-horizontal remap (`div.rs:3220-3224`,
@@ -22,6 +22,34 @@
 //! unreachable here with or without the flag. What the flag does is axis-lock a precise
 //! trackpad gesture through `ongoing_scroll.filter(..)` (`div.rs:3209-3216`), which is live
 //! because `track_scroll` populates `ongoing_scroll` from the tracked handle (`div.rs:2165`).
+//!
+//! "On screen" is decided in `request_layout`, not in `paint`, because laying a row out is
+//! the expensive half and nothing downstream can be narrowed without it. That ordering is
+//! forced rather than chosen: `TextLayout::len`, `bounds`, `line_height` and
+//! `position_for_index` each `expect` on cells filled during measure and prepaint
+//! (`gpui/src/elements/text.rs:864-871`), and `selection_range_for_run` reads `layout.len()`
+//! on *every* run it is handed (`text_selection.rs:388`), so a row whose `StyledText` was
+//! skipped this frame cannot be declared as a run at all — declaring it panics on the first
+//! scroll that has a live selection.
+//!
+//! The copied text is therefore not read off that projection. A selection dragged past the
+//! bottom edge would come back holding only the rows that happened to be on screen, and
+//! nothing would report that it had been cut short. `body::DiffBody::copy_selection` derives
+//! the row span from the selection's own window points instead — `body::selected_rows` — and
+//! asks `body::selection_band` and `body::selected_range` for each row's byte range, shaping
+//! only the at most two rows whose ends the selection cuts through; every row between them is
+//! whole. Endpoints survive scrolling because `gpui-base` stores them relative to
+//! `bounds.origin`, which already carries the scroll, so a point off the top of the viewport
+//! is a negative `y` rather than a lost one. Rows that *are* on screen keep the projection's
+//! own range, so what is highlighted and what is copied cannot drift apart.
+//!
+//! What stays unwindowed is the content width: `body::DiffBody::content_width` shapes every
+//! row on every layout pass, because the horizontal scroll extent has to consider rows that
+//! are not on screen or the scrollbar would resize as the view scrolls vertically, and
+//! because the children are laid out against a width that provably exceeds every row's
+//! natural width — which is what keeps a row one line tall and `ROW_HEIGHT` true. After the
+//! first frame those are hits in gpui's line-layout cache, so the cost is a hash of each
+//! row's bytes rather than a reshape.
 //!
 //! Copying depends on a fact `gpui-base`'s own doc comment does not state. A participant's
 //! runs concatenate with no separator when `update_runs` projects them
