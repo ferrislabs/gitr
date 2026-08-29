@@ -1,4 +1,6 @@
-use domain::{DiffLine, FilePatch, Hunk, LineOrigin, Patch};
+use std::fmt::Write as _;
+
+use domain::{DiffLine, FilePatch, FileStatus, Hunk, LineOrigin, Patch};
 
 use crate::detail::format;
 
@@ -6,7 +8,9 @@ use crate::detail::format;
 pub(super) enum Row {
     FileHeader {
         path: String,
-        stat: String,
+        status: FileStatus,
+        added: usize,
+        deleted: usize,
     },
     HunkHeader {
         text: String,
@@ -33,16 +37,47 @@ pub(super) fn rows(patch: &Patch) -> Vec<Row> {
 
 pub(super) fn file_header(file: &FilePatch) -> Row {
     Row::FileHeader {
-        path: file
-            .display_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
-        stat: file_stat(file),
+        path: header_path(file),
+        status: file.status.clone(),
+        added: file.added_lines(),
+        deleted: file.deleted_lines(),
     }
 }
 
-pub(super) fn file_stat(file: &FilePatch) -> String {
-    format!("+{} \u{2212}{}", file.added_lines(), file.deleted_lines())
+pub(super) fn header_line(path: &str, status: &FileStatus, added: usize, deleted: usize) -> String {
+    let mut text = path.to_string();
+    if let Some(label) = status_label(status) {
+        let _ = write!(text, "  {label}");
+    }
+    let _ = write!(text, "  +{added} \u{2212}{deleted}");
+    text
+}
+
+fn header_path(file: &FilePatch) -> String {
+    let moved = matches!(
+        file.status,
+        FileStatus::Renamed { .. } | FileStatus::Copied { .. }
+    );
+    match (&file.old_path, &file.new_path) {
+        (Some(old), Some(new)) if moved && old != new => {
+            format!("{} \u{2192} {}", old.display(), new.display())
+        }
+        _ => file
+            .display_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+fn status_label(status: &FileStatus) -> Option<String> {
+    match status {
+        FileStatus::Modified => None,
+        FileStatus::Added => Some("added".to_string()),
+        FileStatus::Deleted => Some("deleted".to_string()),
+        FileStatus::Renamed { similarity } => Some(format!("renamed {similarity}%")),
+        FileStatus::Copied { similarity } => Some(format!("copied {similarity}%")),
+        FileStatus::TypeChanged => Some("type changed".to_string()),
+    }
 }
 
 pub(super) fn placeholder(file: &FilePatch) -> Option<Row> {
@@ -107,6 +142,16 @@ mod tests {
             status: FileStatus::Modified,
             is_binary,
             hunks,
+        }
+    }
+
+    fn moved(old: &str, new: &str, status: FileStatus) -> FilePatch {
+        FilePatch {
+            old_path: Some(PathBuf::from(old)),
+            new_path: Some(PathBuf::from(new)),
+            status,
+            is_binary: false,
+            hunks: Vec::new(),
         }
     }
 
@@ -194,6 +239,92 @@ mod tests {
             Row::Placeholder {
                 message: "No content changes."
             }
+        );
+    }
+
+    #[test]
+    fn a_rename_keeps_both_paths_and_its_similarity() {
+        let file = moved(
+            "src/old.rs",
+            "src/new.rs",
+            FileStatus::Renamed { similarity: 87 },
+        );
+        let Row::FileHeader {
+            path,
+            status,
+            added,
+            deleted,
+        } = file_header(&file)
+        else {
+            panic!("a file yields a header row");
+        };
+
+        assert_eq!(path, "src/old.rs \u{2192} src/new.rs");
+        assert_eq!(status, FileStatus::Renamed { similarity: 87 });
+        assert_eq!(
+            header_line(&path, &status, added, deleted),
+            "src/old.rs \u{2192} src/new.rs  renamed 87%  +0 \u{2212}0"
+        );
+    }
+
+    #[test]
+    fn a_copy_reads_as_a_copy_rather_than_as_a_rename() {
+        let file = moved(
+            "src/old.rs",
+            "src/copy.rs",
+            FileStatus::Copied { similarity: 100 },
+        );
+        let Row::FileHeader {
+            path,
+            status,
+            added,
+            deleted,
+        } = file_header(&file)
+        else {
+            panic!("a file yields a header row");
+        };
+
+        assert_eq!(path, "src/old.rs \u{2192} src/copy.rs");
+        assert_eq!(
+            header_line(&path, &status, added, deleted),
+            "src/old.rs \u{2192} src/copy.rs  copied 100%  +0 \u{2212}0"
+        );
+    }
+
+    #[test]
+    fn a_rename_that_only_changed_the_content_shows_one_path() {
+        let file = moved(
+            "src/a.rs",
+            "src/a.rs",
+            FileStatus::Renamed { similarity: 100 },
+        );
+        let Row::FileHeader { path, .. } = file_header(&file) else {
+            panic!("a file yields a header row");
+        };
+        assert_eq!(path, "src/a.rs");
+    }
+
+    #[test]
+    fn a_modified_file_carries_no_status_label() {
+        let patch = Patch {
+            files: vec![file(
+                vec![hunk(vec![line(LineOrigin::Addition, None, Some(1), "new")])],
+                false,
+            )],
+        };
+        let Row::FileHeader {
+            path,
+            status,
+            added,
+            deleted,
+        } = rows(&patch).remove(0)
+        else {
+            panic!("the first row is the file header");
+        };
+
+        assert_eq!(
+            header_line(&path, &status, added, deleted),
+            "src/main.rs  +1 \u{2212}0"
         );
     }
 

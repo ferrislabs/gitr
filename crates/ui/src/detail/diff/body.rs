@@ -1,4 +1,5 @@
 use std::ops::{Range, RangeInclusive};
+use std::rc::Rc;
 
 use domain::LineOrigin;
 use gpui::{
@@ -10,7 +11,8 @@ use gpui::{
 use gpui_base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
 use gpui_component::{ThemeColor, ThemeMode};
 
-use super::model::Row;
+use super::DiffContent;
+use super::model::{Row, header_line};
 use super::pairing::SideLine;
 use super::palette::line_colors;
 use super::split::SplitRow;
@@ -25,6 +27,7 @@ const CODE_LEFT: f32 = 2. * GUTTER_WIDTH + MARKER_WIDTH;
 const SPLIT_CODE_LEFT: f32 = GUTTER_WIDTH + MARKER_WIDTH;
 const COLUMN_RULE_WIDTH: f32 = 1.;
 const TRAILING_SPACE: f32 = 16.;
+const UNMEASURED_ROWS: usize = 100;
 
 pub(super) enum Rows {
     Unified(Vec<Row>),
@@ -37,6 +40,10 @@ impl Rows {
             Rows::Unified(rows) => rows.len(),
             Rows::Split(rows) => rows.len(),
         }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     fn columns(&self) -> usize {
@@ -72,9 +79,14 @@ impl Rows {
     }
 }
 
+pub(super) fn cell_strings(rows: &Rows) -> Vec<SharedString> {
+    (0..rows.cells())
+        .map(|cell| cell_text(rows, cell))
+        .collect()
+}
+
 pub(super) struct DiffBody {
-    rows: Rows,
-    strings: Vec<SharedString>,
+    content: Rc<DiffContent>,
     selection: TextSelectionHandle,
     scroll: ScrollHandle,
     theme: ThemeColor,
@@ -85,18 +97,14 @@ pub(super) struct DiffBody {
 }
 
 pub(super) fn body(
-    rows: Rows,
+    content: Rc<DiffContent>,
     selection: TextSelectionHandle,
     scroll: ScrollHandle,
     theme: ThemeColor,
     mode: ThemeMode,
 ) -> DiffBody {
-    let strings: Vec<SharedString> = (0..rows.cells())
-        .map(|cell| cell_text(&rows, cell))
-        .collect();
     DiffBody {
-        rows,
-        strings,
+        content,
         selection,
         scroll,
         theme,
@@ -127,48 +135,42 @@ fn cell_text(rows: &Rows, cell: usize) -> SharedString {
 
 fn row_text(row: &Row) -> SharedString {
     match row {
-        Row::FileHeader { path, stat } => format!("{path}  {stat}").into(),
+        Row::FileHeader {
+            path,
+            status,
+            added,
+            deleted,
+        } => header_line(path, status, *added, *deleted).into(),
         Row::HunkHeader { text } => text.clone().into(),
         Row::Line { content, .. } => content.clone().into(),
         Row::Placeholder { message } => (*message).into(),
     }
 }
 
-fn styled_cell(
-    rows: &Rows,
-    cell: usize,
-    text: SharedString,
-    theme: &ThemeColor,
-    mode: ThemeMode,
-) -> StyledText {
+fn styled_cell(rows: &Rows, cell: usize, text: SharedString, theme: &ThemeColor) -> StyledText {
     let range = 0..text.len();
     let highlight = HighlightStyle {
-        color: Some(cell_foreground(rows, cell, theme, mode)),
+        color: Some(cell_foreground(rows, cell, theme)),
         ..Default::default()
     };
     StyledText::new(text).with_highlights([(range, highlight)])
 }
 
-fn cell_foreground(rows: &Rows, cell: usize, theme: &ThemeColor, mode: ThemeMode) -> Hsla {
-    let columns = rows.columns();
-    let (row, column) = (cell / columns, cell % columns);
+fn cell_foreground(rows: &Rows, cell: usize, theme: &ThemeColor) -> Hsla {
+    let row = cell / rows.columns();
     match rows {
-        Rows::Unified(rows) => row_foreground(&rows[row], theme, mode),
+        Rows::Unified(rows) => row_foreground(&rows[row], theme),
         Rows::Split(split) => match &split[row] {
-            SplitRow::Full(full) => row_foreground(full, theme, mode),
-            SplitRow::Sides { .. } => rows
-                .side(row, column)
-                .map(|side| line_colors(side.origin, mode, theme).foreground)
-                .unwrap_or(theme.foreground),
+            SplitRow::Full(full) => row_foreground(full, theme),
+            SplitRow::Sides { .. } => theme.foreground,
         },
     }
 }
 
-fn row_foreground(row: &Row, theme: &ThemeColor, mode: ThemeMode) -> Hsla {
+fn row_foreground(row: &Row, theme: &ThemeColor) -> Hsla {
     match row {
-        Row::FileHeader { .. } => theme.foreground,
+        Row::FileHeader { .. } | Row::Line { .. } => theme.foreground,
         Row::HunkHeader { .. } | Row::Placeholder { .. } => theme.muted_foreground,
-        Row::Line { origin, .. } => line_colors(*origin, mode, theme).foreground,
     }
 }
 
@@ -187,6 +189,32 @@ fn marker(origin: LineOrigin) -> &'static str {
         LineOrigin::Deletion => "\u{2212}",
         LineOrigin::Context => " ",
     }
+}
+
+fn column_width(bounds: Bounds<Pixels>, columns: usize) -> Pixels {
+    bounds.size.width / columns as f32
+}
+
+fn column_left(bounds: Bounds<Pixels>, columns: usize, column: usize) -> Pixels {
+    bounds.origin.x + column_width(bounds, columns) * column as f32
+}
+
+fn bounds_for_cell(
+    bounds: Bounds<Pixels>,
+    columns: usize,
+    code_left: Pixels,
+    cell: usize,
+) -> Bounds<Pixels> {
+    Bounds::new(
+        point(
+            column_left(bounds, columns, cell % columns) + code_left,
+            bounds.origin.y + px((cell / columns) as f32 * ROW_HEIGHT),
+        ),
+        size(
+            (column_width(bounds, columns) - code_left).max(px(0.)),
+            px(ROW_HEIGHT),
+        ),
+    )
 }
 
 fn selection_quad_bounds(
@@ -221,7 +249,7 @@ fn selection_quad_bounds(
 
 fn row_window(offset_y: Pixels, viewport: Pixels, rows: usize) -> Range<usize> {
     if viewport <= px(0.) {
-        return 0..rows;
+        return 0..rows.min(UNMEASURED_ROWS);
     }
     let first = ((-offset_y) / px(ROW_HEIGHT)).floor().max(0.) as usize;
     let count = (viewport / px(ROW_HEIGHT)).ceil() as usize + 2;
@@ -407,48 +435,42 @@ fn paint_number(
 }
 
 impl DiffBody {
+    fn rows(&self) -> &Rows {
+        &self.content.rows
+    }
+
+    fn strings(&self) -> &[SharedString] {
+        &self.content.strings
+    }
+
+    fn cell_bounds_at(&self, bounds: Bounds<Pixels>, cell: usize) -> Bounds<Pixels> {
+        bounds_for_cell(
+            bounds,
+            self.rows().columns(),
+            px(self.rows().code_left()),
+            cell,
+        )
+    }
+
     fn content_width(&self, window: &Window) -> Pixels {
         let pen = Pen::new(window);
         let mut widest = px(0.);
-        for text in &self.strings {
+        for text in self.strings() {
             widest = widest.max(pen.width(text.clone(), window));
         }
-        (px(self.rows.code_left()) + widest + px(TRAILING_SPACE)) * self.rows.columns() as f32
-    }
-
-    fn column_width(&self, bounds: Bounds<Pixels>) -> Pixels {
-        bounds.size.width / self.rows.columns() as f32
-    }
-
-    fn column_left(&self, bounds: Bounds<Pixels>, column: usize) -> Pixels {
-        bounds.origin.x + self.column_width(bounds) * column as f32
-    }
-
-    fn bounds_for_cell(&self, bounds: Bounds<Pixels>, cell: usize) -> Bounds<Pixels> {
-        let columns = self.rows.columns();
-        let code_left = px(self.rows.code_left());
-        Bounds::new(
-            point(
-                self.column_left(bounds, cell % columns) + code_left,
-                bounds.origin.y + px((cell / columns) as f32 * ROW_HEIGHT),
-            ),
-            size(
-                (self.column_width(bounds) - code_left).max(px(0.)),
-                px(ROW_HEIGHT),
-            ),
-        )
+        (px(self.rows().code_left()) + widest + px(TRAILING_SPACE)) * self.rows().columns() as f32
     }
 
     fn visible_rows(&self) -> Range<usize> {
         row_window(
             self.scroll.offset().y,
             self.scroll.bounds().size.height,
-            self.rows.len(),
+            self.rows().len(),
         )
     }
 
     fn visible_cells(&self) -> Range<usize> {
-        let columns = self.rows.columns();
+        let columns = self.rows().columns();
         self.visible.start * columns..self.visible.end * columns
     }
 
@@ -473,12 +495,12 @@ impl DiffBody {
             bounds.origin.y,
             anchor.y.min(cursor.y),
             anchor.y.max(cursor.y),
-            self.rows.len(),
+            self.rows().len(),
         ) else {
             return String::new();
         };
 
-        let columns = self.rows.columns();
+        let columns = self.rows().columns();
         let visible = self.visible_cells();
         let cells = rows.start() * columns..(rows.end() + 1) * columns;
         let ranges: Vec<Option<Range<usize>>> = cells
@@ -487,16 +509,21 @@ impl DiffBody {
                 if visible.contains(&cell) {
                     return projected.get(cell - visible.start).and_then(Clone::clone);
                 }
-                let cell_bounds = self.bounds_for_cell(bounds, cell);
+                let cell_bounds = self.cell_bounds_at(bounds, cell);
                 let band = selection_band(cell_bounds.origin.y, anchor, cursor)?;
-                let text = &self.strings[cell];
+                let text = &self.strings()[cell];
                 selected_range(text, band, cell_bounds.origin.x, || {
                     pen.measure(text.clone(), window)
                 })
             })
             .collect();
 
-        copy_text(&self.strings[cells.clone()], &ranges, cells.start, columns)
+        copy_text(
+            &self.strings()[cells.clone()],
+            &ranges,
+            cells.start,
+            columns,
+        )
     }
 
     fn paint_background(
@@ -506,7 +533,8 @@ impl DiffBody {
         top: Pixels,
         window: &mut Window,
     ) {
-        let full_width = match &self.rows {
+        let columns = self.rows().columns();
+        let full_width = match self.rows() {
             Rows::Unified(rows) => Some(&rows[row]),
             Rows::Split(split) => match &split[row] {
                 SplitRow::Full(full) => Some(full),
@@ -525,22 +553,22 @@ impl DiffBody {
                 }
             }
             None => {
-                for column in 0..self.rows.columns() {
-                    let Some(background) = self.rows.side(row, column).and_then(|side| {
+                for column in 0..columns {
+                    let Some(background) = self.rows().side(row, column).and_then(|side| {
                         line_colors(side.origin, self.mode, &self.theme).background
                     }) else {
                         continue;
                     };
                     let band = Bounds::new(
-                        point(self.column_left(bounds, column), top),
-                        size(self.column_width(bounds), px(ROW_HEIGHT)),
+                        point(column_left(bounds, columns, column), top),
+                        size(column_width(bounds, columns), px(ROW_HEIGHT)),
                     );
                     window.paint_quad(fill(band, background));
                 }
 
-                for column in 1..self.rows.columns() {
+                for column in 1..columns {
                     let rule = Bounds::new(
-                        point(self.column_left(bounds, column), top),
+                        point(column_left(bounds, columns, column), top),
                         size(px(COLUMN_RULE_WIDTH), px(ROW_HEIGHT)),
                     );
                     window.paint_quad(fill(rule, self.theme.border));
@@ -558,10 +586,10 @@ impl DiffBody {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let left = cell_bounds.origin.x - px(self.rows.code_left());
+        let left = cell_bounds.origin.x - px(self.rows().code_left());
         let top = cell_bounds.origin.y;
         let muted = self.theme.muted_foreground;
-        let (origin, marker_left) = match &self.rows {
+        let (origin, marker_left) = match self.rows() {
             Rows::Unified(rows) => {
                 let Row::Line {
                     origin,
@@ -593,7 +621,7 @@ impl DiffBody {
                 (origin, left + px(2. * GUTTER_WIDTH + MARKER_PADDING))
             }
             Rows::Split(_) => {
-                let Some(side) = self.rows.side(row, column) else {
+                let Some(side) = self.rows().side(row, column) else {
                     return;
                 };
                 paint_number(
@@ -609,8 +637,8 @@ impl DiffBody {
             }
         };
 
-        let foreground = line_colors(origin, self.mode, &self.theme).foreground;
-        let line = pen.shape(marker(origin).into(), foreground, window);
+        let marker_color = line_colors(origin, self.mode, &self.theme).foreground;
+        let line = pen.shape(marker(origin).into(), marker_color, window);
         paint_line(&line, point(marker_left, top), window, cx);
     }
 }
@@ -647,11 +675,10 @@ impl Element for DiffBody {
             .visible_cells()
             .map(|cell| {
                 styled_cell(
-                    &self.rows,
+                    self.rows(),
                     cell,
-                    self.strings[cell].clone(),
+                    self.content.strings[cell].clone(),
                     &self.theme,
-                    self.mode,
                 )
             })
             .collect();
@@ -666,7 +693,10 @@ impl Element for DiffBody {
         let style = Style {
             flex_direction: FlexDirection::Column,
             flex_shrink: 0.,
-            size: size(width.into(), px(self.rows.len() as f32 * ROW_HEIGHT).into()),
+            size: size(
+                width.into(),
+                px(self.rows().len() as f32 * ROW_HEIGHT).into(),
+            ),
             min_size: size(relative(1.).into(), Length::Auto),
             ..Default::default()
         };
@@ -685,7 +715,7 @@ impl Element for DiffBody {
     ) -> Self::PrepaintState {
         self.cell_bounds = self
             .visible_cells()
-            .map(|cell| self.bounds_for_cell(bounds, cell))
+            .map(|cell| self.cell_bounds_at(bounds, cell))
             .collect();
         for (text, cell_bounds) in self.texts.iter_mut().zip(&self.cell_bounds) {
             text.prepaint(None, None, *cell_bounds, &mut (), window, cx);
@@ -720,7 +750,7 @@ impl Element for DiffBody {
             .map(|(offset, text)| {
                 let cell = first_cell + offset;
                 TextSelectionRun::new(
-                    self.strings[cell].clone(),
+                    self.content.strings[cell].clone(),
                     text.layout().clone(),
                     self.cell_bounds[offset],
                 )
@@ -733,7 +763,7 @@ impl Element for DiffBody {
         let selected = self.copy_selection(bounds, projection.ranges(), &pen, window, cx);
         self.selection.set_fallback_copy_text(selected, cx);
 
-        let columns = self.rows.columns();
+        let columns = self.rows().columns();
         for (offset, row) in self.visible.clone().enumerate() {
             let top = self.cell_bounds[offset * columns].origin.y;
             self.paint_background(row, bounds, top, window);
@@ -768,6 +798,207 @@ impl Element for DiffBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::FileStatus;
+
+    fn file_header() -> Row {
+        Row::FileHeader {
+            path: "src/main.rs".to_string(),
+            status: FileStatus::Modified,
+            added: 3,
+            deleted: 1,
+        }
+    }
+
+    fn hunk_header() -> Row {
+        Row::HunkHeader {
+            text: "@@ -1,3 +1,4 @@".to_string(),
+        }
+    }
+
+    fn line(origin: LineOrigin, content: &str) -> Row {
+        Row::Line {
+            origin,
+            old_number: Some(1),
+            new_number: Some(1),
+            content: content.to_string(),
+        }
+    }
+
+    fn side(origin: LineOrigin, content: &str) -> SideLine {
+        SideLine {
+            number: Some(1),
+            origin,
+            content: content.to_string(),
+        }
+    }
+
+    fn split_rows() -> Rows {
+        Rows::Split(vec![
+            SplitRow::Full(hunk_header()),
+            SplitRow::Sides {
+                left: Some(side(LineOrigin::Deletion, "gone")),
+                right: None,
+            },
+        ])
+    }
+
+    #[test]
+    fn a_unified_view_has_one_column_and_a_split_view_two() {
+        let unified = Rows::Unified(vec![file_header(), line(LineOrigin::Context, "keep")]);
+        let split = split_rows();
+
+        assert_eq!(unified.columns(), 1);
+        assert_eq!(unified.cells(), 2);
+        assert_eq!(unified.code_left(), CODE_LEFT);
+
+        assert_eq!(split.columns(), 2);
+        assert_eq!(split.cells(), 4);
+        assert_eq!(split.code_left(), SPLIT_CODE_LEFT);
+    }
+
+    #[test]
+    fn an_empty_row_list_is_empty_in_either_view() {
+        assert!(Rows::Unified(Vec::new()).is_empty());
+        assert!(Rows::Split(Vec::new()).is_empty());
+        assert!(!Rows::Unified(vec![file_header()]).is_empty());
+    }
+
+    #[test]
+    fn only_a_split_row_with_two_sides_has_a_side() {
+        let rows = split_rows();
+
+        assert_eq!(rows.side(0, 0), None, "a full-width row has no side");
+        assert_eq!(
+            rows.side(1, 0).map(|side| side.content.as_str()),
+            Some("gone")
+        );
+        assert_eq!(rows.side(1, 1), None, "the padded side is absent");
+        assert_eq!(
+            Rows::Unified(vec![file_header()]).side(0, 0),
+            None,
+            "a unified row has no sides at all"
+        );
+    }
+
+    #[test]
+    fn a_row_renders_its_own_kind_of_text() {
+        assert_eq!(
+            row_text(&file_header()),
+            SharedString::from("src/main.rs  +3 \u{2212}1")
+        );
+        assert_eq!(
+            row_text(&hunk_header()),
+            SharedString::from("@@ -1,3 +1,4 @@")
+        );
+        assert_eq!(
+            row_text(&line(LineOrigin::Addition, "let x = 1;")),
+            SharedString::from("let x = 1;")
+        );
+        assert_eq!(
+            row_text(&Row::Placeholder {
+                message: "Binary file not shown."
+            }),
+            SharedString::from("Binary file not shown.")
+        );
+    }
+
+    #[test]
+    fn a_unified_cell_is_its_row() {
+        let rows = Rows::Unified(vec![file_header(), line(LineOrigin::Deletion, "gone")]);
+        assert_eq!(
+            cell_text(&rows, 0),
+            SharedString::from("src/main.rs  +3 \u{2212}1")
+        );
+        assert_eq!(cell_text(&rows, 1), SharedString::from("gone"));
+    }
+
+    #[test]
+    fn a_full_width_split_row_renders_in_the_first_column_and_blank_in_the_second() {
+        let rows = split_rows();
+        assert_eq!(cell_text(&rows, 0), SharedString::from("@@ -1,3 +1,4 @@"));
+        assert_eq!(cell_text(&rows, 1), SharedString::default());
+    }
+
+    #[test]
+    fn a_split_row_puts_each_side_in_its_own_column_and_pads_the_missing_one() {
+        let rows = split_rows();
+        assert_eq!(cell_text(&rows, 2), SharedString::from("gone"));
+        assert_eq!(cell_text(&rows, 3), SharedString::default());
+    }
+
+    #[test]
+    fn a_marker_names_the_origin_and_a_context_line_keeps_the_column_wide() {
+        assert_eq!(marker(LineOrigin::Addition), "+");
+        assert_eq!(marker(LineOrigin::Deletion), "\u{2212}");
+        assert_eq!(marker(LineOrigin::Context), " ");
+    }
+
+    #[test]
+    fn only_a_changed_line_and_the_two_headers_are_banded() {
+        let theme = ThemeColor::light();
+        let mode = ThemeMode::Light;
+
+        assert_eq!(
+            row_background(&file_header(), &theme, mode),
+            Some(theme.secondary)
+        );
+        assert_eq!(
+            row_background(&hunk_header(), &theme, mode),
+            Some(theme.muted)
+        );
+        assert_eq!(
+            row_background(
+                &Row::Placeholder {
+                    message: "No content changes."
+                },
+                &theme,
+                mode
+            ),
+            None
+        );
+        assert_eq!(
+            row_background(&line(LineOrigin::Context, "keep"), &theme, mode),
+            None
+        );
+        assert_eq!(
+            row_background(&line(LineOrigin::Addition, "new"), &theme, mode),
+            line_colors(LineOrigin::Addition, mode, &theme).background
+        );
+    }
+
+    #[test]
+    fn a_column_takes_an_equal_share_of_the_width_from_left_to_right() {
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(200.), px(400.)));
+
+        assert_eq!(column_width(bounds, 1), px(200.));
+        assert_eq!(column_width(bounds, 2), px(100.));
+        assert_eq!(column_left(bounds, 2, 0), px(10.));
+        assert_eq!(column_left(bounds, 2, 1), px(110.));
+    }
+
+    #[test]
+    fn a_cell_sits_at_its_column_past_the_gutters_and_at_its_row() {
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(200.), px(400.)));
+
+        assert_eq!(
+            bounds_for_cell(bounds, 2, px(60.), 3),
+            Bounds::new(
+                point(px(170.), px(20. + ROW_HEIGHT)),
+                size(px(40.), px(ROW_HEIGHT))
+            ),
+            "cell 3 is the right column of the second row"
+        );
+        assert_eq!(
+            bounds_for_cell(bounds, 1, px(104.), 0),
+            Bounds::new(point(px(114.), px(20.)), size(px(96.), px(ROW_HEIGHT)))
+        );
+    }
+
+    #[test]
+    fn a_column_narrower_than_its_gutters_leaves_no_width_rather_than_a_negative_one() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(80.), px(400.)));
+        assert_eq!(bounds_for_cell(bounds, 2, px(60.), 0).size.width, px(0.));
+    }
 
     #[test]
     fn copy_text_joins_the_selected_rows_with_newlines() {
@@ -860,8 +1091,9 @@ mod tests {
     }
 
     #[test]
-    fn the_window_is_every_row_until_the_viewport_has_been_measured() {
-        assert_eq!(row_window(px(0.), px(0.), 500), 0..500);
+    fn the_window_is_one_screenful_until_the_viewport_has_been_measured() {
+        assert_eq!(row_window(px(0.), px(0.), 500), 0..UNMEASURED_ROWS);
+        assert_eq!(row_window(px(0.), px(0.), 12), 0..12);
     }
 
     #[test]

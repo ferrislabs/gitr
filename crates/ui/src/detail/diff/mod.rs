@@ -63,9 +63,12 @@
 //! cell on every layout pass, because the horizontal scroll extent has to consider rows that
 //! are not on screen or the scrollbar would resize as the view scrolls vertically, and
 //! because a cell is laid out against a column width that provably exceeds every cell's
-//! natural width — which is what keeps a row one line tall and `ROW_HEIGHT` true. After the
-//! first frame those are hits in gpui's line-layout cache, so the cost is a hash of each
-//! cell's bytes rather than a reshape.
+//! natural width — which is what keeps a row one line tall and `ROW_HEIGHT` true. That is
+//! affordable only because the text it measures is not rebuilt with it: [`DiffContent`]
+//! holds the rows and one [`gpui::SharedString`] per cell, derived by [`content`] when the
+//! patch or the view mode changes and handed to the element behind an `Rc` thereafter. So
+//! after the first frame each cell is a hit in gpui's line-layout cache and the steady-state
+//! cost is a hash of bytes that are already there, with no allocation and no reshape.
 //!
 //! Copying depends on a fact `gpui-base`'s own doc comment does not state. A participant's
 //! runs concatenate with no separator when `update_runs` projects them
@@ -95,10 +98,12 @@ mod pairing;
 mod palette;
 mod split;
 
+use std::rc::Rc;
+
 use domain::Patch;
 use gpui::{
     AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _, ScrollHandle,
-    StatefulInteractiveElement as _, Styled as _, div, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
 use gpui_base::TextSelectionHandle;
 use gpui_component::{
@@ -108,18 +113,37 @@ use gpui_component::{
 
 use crate::diff_view_mode::DiffViewMode;
 
-use body::{ROW_HEIGHT, Rows, body};
+use body::{ROW_HEIGHT, Rows, body, cell_strings};
 use model::rows;
 use split::split_rows;
 
+pub(super) struct DiffContent {
+    rows: Rows,
+    strings: Vec<SharedString>,
+}
+
+impl DiffContent {
+    pub(super) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+pub(super) fn content(patch: &Patch, mode: DiffViewMode) -> DiffContent {
+    let rows = match mode {
+        DiffViewMode::Unified => Rows::Unified(rows(patch)),
+        DiffViewMode::Split => Rows::Split(split_rows(patch)),
+    };
+    let strings = cell_strings(&rows);
+    DiffContent { rows, strings }
+}
+
 pub(super) fn render(
-    patch: &Patch,
-    mode: DiffViewMode,
+    content: Option<&Rc<DiffContent>>,
     selection: &TextSelectionHandle,
     scroll: &ScrollHandle,
     cx: &App,
 ) -> AnyElement {
-    if patch.files.is_empty() {
+    let Some(content) = content.filter(|content| !content.is_empty()) else {
         return div()
             .size_full()
             .flex()
@@ -128,11 +152,6 @@ pub(super) fn render(
             .text_color(cx.theme().muted_foreground)
             .child("This commit changes nothing.")
             .into_any_element();
-    }
-
-    let content = match mode {
-        DiffViewMode::Unified => Rows::Unified(rows(patch)),
-        DiffViewMode::Split => Rows::Split(split_rows(patch)),
     };
 
     let theme = cx.theme();
@@ -150,7 +169,7 @@ pub(super) fn render(
                 .text_size(theme.mono_font_size)
                 .line_height(px(ROW_HEIGHT))
                 .child(body(
-                    content,
+                    Rc::clone(content),
                     selection.clone(),
                     scroll.clone(),
                     theme.colors,

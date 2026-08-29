@@ -74,6 +74,16 @@ mod tests {
         ])
     }
 
+    fn moved(old: &str, new: &str, status: FileStatus) -> FilePatch {
+        FilePatch {
+            old_path: Some(PathBuf::from(old)),
+            new_path: Some(PathBuf::from(new)),
+            status,
+            is_binary: false,
+            hunks: Vec::new(),
+        }
+    }
+
     fn paths(rows: &[SplitRow]) -> Vec<String> {
         rows.iter()
             .filter_map(|row| match row {
@@ -193,6 +203,59 @@ mod tests {
             rows[1],
             SplitRow::Full(Row::Placeholder {
                 message: "No content changes."
+            })
+        );
+    }
+
+    #[test]
+    fn a_rename_with_no_content_change_still_names_both_paths() {
+        let patch = Patch {
+            files: vec![moved(
+                "src/old.rs",
+                "src/new.rs",
+                FileStatus::Renamed { similarity: 87 },
+            )],
+        };
+
+        let rows = split_rows(&patch);
+
+        assert_eq!(paths(&rows), vec!["src/old.rs \u{2192} src/new.rs"]);
+        assert_eq!(
+            rows[0],
+            SplitRow::Full(Row::FileHeader {
+                path: "src/old.rs \u{2192} src/new.rs".to_string(),
+                status: FileStatus::Renamed { similarity: 87 },
+                added: 0,
+                deleted: 0,
+            })
+        );
+        assert_eq!(
+            rows[1],
+            SplitRow::Full(Row::Placeholder {
+                message: "No content changes."
+            })
+        );
+    }
+
+    #[test]
+    fn a_copy_carries_its_own_status_into_the_header_row() {
+        let patch = Patch {
+            files: vec![moved(
+                "src/old.rs",
+                "src/copy.rs",
+                FileStatus::Copied { similarity: 100 },
+            )],
+        };
+
+        let rows = split_rows(&patch);
+
+        assert_eq!(
+            rows[0],
+            SplitRow::Full(Row::FileHeader {
+                path: "src/old.rs \u{2192} src/copy.rs".to_string(),
+                status: FileStatus::Copied { similarity: 100 },
+                added: 0,
+                deleted: 0,
             })
         );
     }

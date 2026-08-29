@@ -14,15 +14,17 @@
 //! which rows to lay out and paint — it is the only input it has to that decision before
 //! the frame gives it any bounds.
 //!
-//! The one piece of view state that does need to outlive a frame is the diff's selection
-//! participant: `gpui-base` keys a window-level selection off a
+//! Two pieces of view state have to outlive a frame, and both for the same reason: a
+//! render must not build them. `gpui-base` keys a window-level selection off a
 //! [`TextSelectionHandle`], and a handle rebuilt per frame would drop the selection on
-//! every repaint. It is built once in [`DetailPanel::new`], which is also the only place
-//! with the `&Window` its refresh subscription needs. Nothing else here is staged:
-//! [`DetailPanel::set_detail`] stores the new [`LoadState`] and notifies, and the rows are
-//! derived from the patch during the render that follows.
-//! [`DetailPanel::selected_tab`] is never touched by `set_detail`, which is what lets
-//! picking a different commit leave the open tab alone.
+//! every repaint, so it is built once in [`DetailPanel::new`]. The diff's rows and the
+//! string of every cell in them are derived from the patch, and deriving them per frame
+//! would copy every line of the patch two or three times over on every repaint —
+//! `refresh_window_on_change` repaints on each mouse move of a selection drag, so that is
+//! not a rare frame. They are rebuilt by [`DetailPanel::set_detail`] and
+//! [`DetailPanel::set_diff_view_mode`], which are the only two places the patch or the
+//! view mode can change. [`DetailPanel::selected_tab`] is never touched by `set_detail`,
+//! which is what lets picking a different commit leave the open tab alone.
 //!
 //! The diff view mode is read once from disk in [`DetailPanel::new`], before the first
 //! frame, and written back through `cx.background_executor()`:
@@ -37,13 +39,17 @@
 //! endpoint relative to `bounds.origin` (`text_selection.rs:1336`), so it survives the
 //! content underneath it changing, and a stored `y` then resolves onto whatever row now sits
 //! at that offset — a highlight over lines the user never dragged across, which Cmd-C would
-//! copy. `TextSelection::clear` is window-wide rather than per-participant, which costs
-//! nothing here because the diff body is the only participant this crate registers.
+//! copy. `TextSelection::clear` is window-wide rather than per-participant, and this panel
+//! has participants beyond the diff body: [`metadata`] renders every value through
+//! [`gpui_component::text::markdown`], and each `TextView` registers one of its own. They
+//! are cleared too, which is the right outcome — they are selections over the commit that
+//! is being replaced.
 
 mod diff;
 mod format;
 mod metadata;
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
@@ -64,6 +70,8 @@ use gpui_component::{
 use crate::diff_view_mode::DiffViewMode;
 use crate::persistence;
 use crate::repository::{CommitDetail, LoadState};
+
+use diff::DiffContent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DetailTab {
@@ -93,6 +101,7 @@ impl DetailTab {
 
 pub struct DetailPanel {
     detail: LoadState<Arc<CommitDetail>>,
+    diff_content: Option<Rc<DiffContent>>,
     diff_selection: TextSelectionHandle,
     diff_view_mode: DiffViewMode,
     selected_tab: DetailTab,
@@ -107,6 +116,7 @@ impl DetailPanel {
         diff_selection.refresh_window_on_change(window, cx).detach();
         Self {
             detail: LoadState::Idle,
+            diff_content: None,
             diff_selection,
             diff_view_mode: persistence::load_diff_view_mode().unwrap_or_default(),
             selected_tab: DetailTab::default(),
@@ -123,6 +133,7 @@ impl DetailPanel {
         cx: &mut Context<Self>,
     ) {
         self.detail = detail;
+        self.rebuild_diff_content();
         self.reset_diff_view(window, cx);
         cx.notify();
     }
@@ -137,6 +148,7 @@ impl DetailPanel {
             return;
         }
         self.diff_view_mode = mode;
+        self.rebuild_diff_content();
         self.reset_diff_view(window, cx);
 
         cx.background_executor()
@@ -148,6 +160,15 @@ impl DetailPanel {
             .detach();
 
         cx.notify();
+    }
+
+    fn rebuild_diff_content(&mut self) {
+        self.diff_content = match &self.detail {
+            LoadState::Ready(detail) => {
+                Some(Rc::new(diff::content(&detail.patch, self.diff_view_mode)))
+            }
+            _ => None,
+        };
     }
 
     fn reset_diff_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -194,7 +215,7 @@ impl Render for DetailPanel {
                 LoadState::Ready(detail) => ready_state(
                     detail,
                     selected_tab,
-                    diff_view_mode,
+                    self.diff_content.as_ref(),
                     &self.diff_selection,
                     &self.general_scroll_handle,
                     &self.diff_scroll_handle,
@@ -292,7 +313,7 @@ fn failed_state(message: &str) -> AnyElement {
 fn ready_state(
     detail: &CommitDetail,
     selected_tab: DetailTab,
-    diff_view_mode: DiffViewMode,
+    diff_content: Option<&Rc<DiffContent>>,
     diff_selection: &TextSelectionHandle,
     general_scroll_handle: &ScrollHandle,
     diff_scroll_handle: &ScrollHandle,
@@ -300,13 +321,7 @@ fn ready_state(
 ) -> AnyElement {
     match selected_tab {
         DetailTab::General => general_tab(detail, general_scroll_handle, cx),
-        DetailTab::Diff => diff_tab(
-            detail,
-            diff_view_mode,
-            diff_selection,
-            diff_scroll_handle,
-            cx,
-        ),
+        DetailTab::Diff => diff_tab(diff_content, diff_selection, diff_scroll_handle, cx),
     }
 }
 
@@ -336,8 +351,7 @@ fn general_tab(detail: &CommitDetail, scroll_handle: &ScrollHandle, cx: &App) ->
 }
 
 fn diff_tab(
-    detail: &CommitDetail,
-    mode: DiffViewMode,
+    content: Option<&Rc<DiffContent>>,
     selection: &TextSelectionHandle,
     scroll_handle: &ScrollHandle,
     cx: &App,
@@ -346,12 +360,6 @@ fn diff_tab(
         .flex_1()
         .min_h_0()
         .min_w_0()
-        .child(diff::render(
-            &detail.patch,
-            mode,
-            selection,
-            scroll_handle,
-            cx,
-        ))
+        .child(diff::render(content, selection, scroll_handle, cx))
         .into_any_element()
 }
