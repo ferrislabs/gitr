@@ -13,7 +13,7 @@
 //! A row carries one cell in [`DiffViewMode::Unified`] and two in [`DiffViewMode::Split`],
 //! which is the only difference between the two views: [`body::Rows`] answers how many
 //! columns a body has, and every horizontal position — the content width, a cell's bounds,
-//! a gutter's origin — is that column's share of the element's width. A file, hunk or
+//! a gutter's origin — is that column's share of the element's width. A file, separator or
 //! placeholder row keeps one full-width cell in either view, so the columns stay uniform
 //! and a cell is `row * columns + column` rather than a lookup. Because a column is laid
 //! out against `content_width / columns` and the width is measured over every cell, a
@@ -70,7 +70,10 @@
 //! natural width — which is what keeps a row one line tall and `ROW_HEIGHT` true. That is
 //! affordable only because the text it measures is not rebuilt with it: [`DiffContent`]
 //! holds the rows and one [`gpui::SharedString`] per cell, derived by [`content`] when the
-//! patch or the view mode changes and handed to the element behind an `Rc` thereafter. So
+//! patch, the view mode or the set of collapsed files changes and handed to the element
+//! behind an `Rc` thereafter. Collapsing is applied in that derivation — the body rows of a
+//! collapsed file are never emitted — so the element windows, paints and selects over a
+//! shorter list and knows nothing of collapsing beyond mapping a click to a row. So
 //! after the first frame each cell is a hit in gpui's line-layout cache and the steady-state
 //! cost is a hash of bytes that are already there, with no allocation and no reshape.
 //!
@@ -102,12 +105,13 @@ mod pairing;
 mod palette;
 mod split;
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use domain::Patch;
 use gpui::{
-    AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
+    AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_base::TextSelectionHandle;
 use gpui_component::{
@@ -121,6 +125,10 @@ use body::{ROW_HEIGHT, Rows, body, cell_strings};
 use model::rows;
 use split::split_rows;
 
+pub(super) type Collapsed = HashSet<usize>;
+
+pub(super) type ToggleFile = Rc<dyn Fn(&usize, &mut Window, &mut App)>;
+
 pub(super) struct DiffContent {
     rows: Rows,
     strings: Vec<SharedString>,
@@ -130,12 +138,16 @@ impl DiffContent {
     pub(super) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+
+    pub(super) fn height(&self) -> Pixels {
+        px(self.rows.len() as f32 * ROW_HEIGHT)
+    }
 }
 
-pub(super) fn content(patch: &Patch, mode: DiffViewMode) -> DiffContent {
+pub(super) fn content(patch: &Patch, mode: DiffViewMode, collapsed: &Collapsed) -> DiffContent {
     let rows = match mode {
-        DiffViewMode::Unified => Rows::Unified(rows(patch)),
-        DiffViewMode::Split => Rows::Split(split_rows(patch)),
+        DiffViewMode::Unified => Rows::Unified(rows(patch, collapsed)),
+        DiffViewMode::Split => Rows::Split(split_rows(patch, collapsed)),
     };
     let strings = cell_strings(&rows);
     DiffContent { rows, strings }
@@ -146,6 +158,7 @@ pub(super) fn render(
     select_all: bool,
     selection: &TextSelectionHandle,
     scroll: &ScrollHandle,
+    toggle_file: ToggleFile,
     cx: &App,
 ) -> AnyElement {
     let Some(content) = content.filter(|content| !content.is_empty()) else {
@@ -178,6 +191,7 @@ pub(super) fn render(
                     select_all,
                     selection.clone(),
                     scroll.clone(),
+                    toggle_file,
                     theme.colors,
                     theme.mode,
                 )),

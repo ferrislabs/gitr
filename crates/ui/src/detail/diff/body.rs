@@ -3,19 +3,19 @@ use std::rc::Rc;
 
 use domain::LineOrigin;
 use gpui::{
-    App, Bounds, Element, ElementId, FlexDirection, GlobalElementId, Half as _, HighlightStyle,
-    Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, Length, Pixels, Point,
-    ScrollHandle, ShapedLine, SharedString, Style, StyledText, TextAlign, TextLayout, TextStyle,
-    Window, fill, point, px, relative, size,
+    App, Bounds, DispatchPhase, Element, ElementId, FlexDirection, GlobalElementId, Half as _,
+    HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
+    Length, MouseButton, MouseDownEvent, Pixels, Point, ScrollHandle, ShapedLine, SharedString,
+    Style, StyledText, TextAlign, TextLayout, TextStyle, Window, fill, point, px, relative, size,
 };
 use gpui_base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
 use gpui_component::{ThemeColor, ThemeMode};
 
-use super::DiffContent;
 use super::model::{Row, header_line};
 use super::pairing::SideLine;
 use super::palette::line_colors;
 use super::split::SplitRow;
+use super::{DiffContent, ToggleFile};
 
 pub(super) const ROW_HEIGHT: f32 = 18.;
 
@@ -35,7 +35,7 @@ pub(super) enum Rows {
 }
 
 impl Rows {
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         match self {
             Rows::Unified(rows) => rows.len(),
             Rows::Split(rows) => rows.len(),
@@ -64,6 +64,20 @@ impl Rows {
         self.len() * self.columns()
     }
 
+    fn file_at(&self, row: usize) -> Option<usize> {
+        let row = match self {
+            Rows::Unified(rows) => rows.get(row)?,
+            Rows::Split(rows) => match rows.get(row)? {
+                SplitRow::Full(full) => full,
+                SplitRow::Sides { .. } => return None,
+            },
+        };
+        match row {
+            Row::FileHeader { file, .. } => Some(*file),
+            _ => None,
+        }
+    }
+
     fn side(&self, row: usize, column: usize) -> Option<&SideLine> {
         let Rows::Split(rows) = self else {
             return None;
@@ -90,6 +104,7 @@ pub(super) struct DiffBody {
     select_all: bool,
     selection: TextSelectionHandle,
     scroll: ScrollHandle,
+    toggle_file: ToggleFile,
     theme: ThemeColor,
     mode: ThemeMode,
     visible: Range<usize>,
@@ -102,6 +117,7 @@ pub(super) fn body(
     select_all: bool,
     selection: TextSelectionHandle,
     scroll: ScrollHandle,
+    toggle_file: ToggleFile,
     theme: ThemeColor,
     mode: ThemeMode,
 ) -> DiffBody {
@@ -110,6 +126,7 @@ pub(super) fn body(
         select_all,
         selection,
         scroll,
+        toggle_file,
         theme,
         mode,
         visible: 0..0,
@@ -143,8 +160,10 @@ fn row_text(row: &Row) -> SharedString {
             status,
             added,
             deleted,
-        } => header_line(path, status, *added, *deleted).into(),
-        Row::HunkHeader { text } => text.clone().into(),
+            collapsed,
+            ..
+        } => header_line(path, status, *added, *deleted, *collapsed).into(),
+        Row::Separator => SharedString::default(),
         Row::Line { content, .. } => content.clone().into(),
         Row::Placeholder { message } => (*message).into(),
     }
@@ -173,14 +192,14 @@ fn cell_foreground(rows: &Rows, cell: usize, theme: &ThemeColor) -> Hsla {
 fn row_foreground(row: &Row, theme: &ThemeColor) -> Hsla {
     match row {
         Row::FileHeader { .. } | Row::Line { .. } => theme.foreground,
-        Row::HunkHeader { .. } | Row::Placeholder { .. } => theme.muted_foreground,
+        Row::Separator | Row::Placeholder { .. } => theme.muted_foreground,
     }
 }
 
 fn row_background(row: &Row, theme: &ThemeColor, mode: ThemeMode) -> Option<Hsla> {
     match row {
         Row::FileHeader { .. } => Some(theme.secondary),
-        Row::HunkHeader { .. } => Some(theme.muted),
+        Row::Separator => Some(theme.muted),
         Row::Placeholder { .. } => None,
         Row::Line { origin, .. } => line_colors(*origin, mode, theme).background,
     }
@@ -257,6 +276,11 @@ fn row_window(offset_y: Pixels, viewport: Pixels, rows: usize) -> Range<usize> {
     let first = ((-offset_y) / px(ROW_HEIGHT)).floor().max(0.) as usize;
     let count = (viewport / px(ROW_HEIGHT)).ceil() as usize + 2;
     first.min(rows)..first.saturating_add(count).min(rows)
+}
+
+fn row_at(origin_y: Pixels, y: Pixels, rows: usize) -> Option<usize> {
+    let row = ((y - origin_y) / px(ROW_HEIGHT)).floor();
+    (row >= 0. && row < rows as f32).then_some(row as usize)
 }
 
 fn selected_rows(
@@ -656,6 +680,28 @@ impl DiffBody {
         let line = pen.shape(marker(origin).into(), marker_color, window);
         paint_line(&line, point(marker_left, top), window, cx);
     }
+
+    fn on_mouse_down(&self, bounds: Bounds<Pixels>, hitbox: &Hitbox, window: &mut Window) {
+        let hitbox = hitbox.clone();
+        let content = Rc::clone(&self.content);
+        let toggle_file = Rc::clone(&self.toggle_file);
+        let origin_y = bounds.origin.y;
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble
+                || event.button != MouseButton::Left
+                || event.click_count != 1
+                || !hitbox.is_hovered(window)
+            {
+                return;
+            }
+            let Some(row) = row_at(origin_y, event.position.y, content.rows.len()) else {
+                return;
+            };
+            if let Some(file) = content.rows.file_at(row) {
+                toggle_file(&file, window, cx);
+            }
+        });
+    }
 }
 
 impl IntoElement for DiffBody {
@@ -755,10 +801,12 @@ impl Element for DiffBody {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
+        hitbox: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.on_mouse_down(bounds, hitbox, window);
+
         let first_cell = self.visible_cells().start;
         let runs: Vec<TextSelectionRun> = self
             .texts
@@ -824,16 +872,12 @@ mod tests {
 
     fn file_header() -> Row {
         Row::FileHeader {
+            file: 0,
             path: "src/main.rs".to_string(),
             status: FileStatus::Modified,
             added: 3,
             deleted: 1,
-        }
-    }
-
-    fn hunk_header() -> Row {
-        Row::HunkHeader {
-            text: "@@ -1,3 +1,4 @@".to_string(),
+            collapsed: false,
         }
     }
 
@@ -856,7 +900,7 @@ mod tests {
 
     fn split_rows() -> Rows {
         Rows::Split(vec![
-            SplitRow::Full(hunk_header()),
+            SplitRow::Full(file_header()),
             SplitRow::Sides {
                 left: Some(side(LineOrigin::Deletion, "gone")),
                 right: None,
@@ -903,15 +947,32 @@ mod tests {
     }
 
     #[test]
+    fn only_a_file_header_row_names_a_file() {
+        let unified = Rows::Unified(vec![
+            file_header(),
+            Row::Separator,
+            line(LineOrigin::Context, "keep"),
+        ]);
+
+        assert_eq!(unified.file_at(0), Some(0));
+        assert_eq!(unified.file_at(1), None);
+        assert_eq!(unified.file_at(2), None);
+        assert_eq!(unified.file_at(3), None, "there is no fourth row");
+        assert_eq!(split_rows().file_at(0), Some(0));
+        assert_eq!(
+            split_rows().file_at(1),
+            None,
+            "a two-sided row is never a header"
+        );
+    }
+
+    #[test]
     fn a_row_renders_its_own_kind_of_text() {
         assert_eq!(
             row_text(&file_header()),
-            SharedString::from("src/main.rs  +3 \u{2212}1")
+            SharedString::from("\u{25be} src/main.rs  +3 \u{2212}1")
         );
-        assert_eq!(
-            row_text(&hunk_header()),
-            SharedString::from("@@ -1,3 +1,4 @@")
-        );
+        assert_eq!(row_text(&Row::Separator), SharedString::default());
         assert_eq!(
             row_text(&line(LineOrigin::Addition, "let x = 1;")),
             SharedString::from("let x = 1;")
@@ -929,7 +990,7 @@ mod tests {
         let rows = Rows::Unified(vec![file_header(), line(LineOrigin::Deletion, "gone")]);
         assert_eq!(
             cell_text(&rows, 0),
-            SharedString::from("src/main.rs  +3 \u{2212}1")
+            SharedString::from("\u{25be} src/main.rs  +3 \u{2212}1")
         );
         assert_eq!(cell_text(&rows, 1), SharedString::from("gone"));
     }
@@ -937,8 +998,38 @@ mod tests {
     #[test]
     fn a_full_width_split_row_renders_in_the_first_column_and_blank_in_the_second() {
         let rows = split_rows();
-        assert_eq!(cell_text(&rows, 0), SharedString::from("@@ -1,3 +1,4 @@"));
+        assert_eq!(
+            cell_text(&rows, 0),
+            SharedString::from("\u{25be} src/main.rs  +3 \u{2212}1")
+        );
         assert_eq!(cell_text(&rows, 1), SharedString::default());
+    }
+
+    #[test]
+    fn a_separator_carries_no_text_in_either_view() {
+        let unified = Rows::Unified(vec![Row::Separator]);
+        let split = Rows::Split(vec![SplitRow::Full(Row::Separator)]);
+
+        assert_eq!(cell_text(&unified, 0), SharedString::default());
+        assert_eq!(cell_text(&split, 0), SharedString::default());
+        assert_eq!(cell_text(&split, 1), SharedString::default());
+    }
+
+    #[test]
+    fn a_collapsed_header_turns_its_disclosure_marker_sideways() {
+        let collapsed = Row::FileHeader {
+            file: 0,
+            path: "src/main.rs".to_string(),
+            status: FileStatus::Modified,
+            added: 3,
+            deleted: 1,
+            collapsed: true,
+        };
+
+        assert_eq!(
+            row_text(&collapsed),
+            SharedString::from("\u{25b8} src/main.rs  +3 \u{2212}1")
+        );
     }
 
     #[test]
@@ -956,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_changed_line_and_the_two_headers_are_banded() {
+    fn only_a_changed_line_the_file_header_and_a_separator_are_banded() {
         let theme = ThemeColor::light();
         let mode = ThemeMode::Light;
 
@@ -965,7 +1056,7 @@ mod tests {
             Some(theme.secondary)
         );
         assert_eq!(
-            row_background(&hunk_header(), &theme, mode),
+            row_background(&Row::Separator, &theme, mode),
             Some(theme.muted)
         );
         assert_eq!(
@@ -1142,6 +1233,21 @@ mod tests {
             row_window(px(-900. * ROW_HEIGHT), px(10. * ROW_HEIGHT), 500),
             500..500
         );
+    }
+
+    #[test]
+    fn a_click_lands_on_the_row_its_height_puts_it_in() {
+        assert_eq!(row_at(px(100.), px(100.), 3), Some(0));
+        assert_eq!(row_at(px(100.), px(100. + ROW_HEIGHT - 1.), 3), Some(0));
+        assert_eq!(row_at(px(100.), px(100. + ROW_HEIGHT), 3), Some(1));
+        assert_eq!(row_at(px(100.), px(100. + 2.5 * ROW_HEIGHT), 3), Some(2));
+    }
+
+    #[test]
+    fn a_click_outside_the_rows_lands_on_none_of_them() {
+        assert_eq!(row_at(px(100.), px(99.), 3), None);
+        assert_eq!(row_at(px(100.), px(100. + 3. * ROW_HEIGHT), 3), None);
+        assert_eq!(row_at(px(100.), px(100.), 0), None);
     }
 
     #[test]

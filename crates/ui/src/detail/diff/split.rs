@@ -1,6 +1,7 @@
 use domain::Patch;
 
-use super::model::{Row, file_header, hunk_header, placeholder};
+use super::Collapsed;
+use super::model::{Row, file_header, placeholder};
 use super::pairing::{SideLine, pair};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,16 +13,25 @@ pub(super) enum SplitRow {
     },
 }
 
-pub(super) fn split_rows(patch: &Patch) -> Vec<SplitRow> {
+pub(super) fn split_rows(patch: &Patch, collapsed: &Collapsed) -> Vec<SplitRow> {
     let mut rows = Vec::new();
-    for file in &patch.files {
-        rows.push(SplitRow::Full(file_header(file)));
-        if let Some(placeholder) = placeholder(file) {
+    for (file, patch) in patch.files.iter().enumerate() {
+        rows.push(SplitRow::Full(file_header(
+            file,
+            patch,
+            collapsed.contains(&file),
+        )));
+        if collapsed.contains(&file) {
+            continue;
+        }
+        if let Some(placeholder) = placeholder(patch) {
             rows.push(SplitRow::Full(placeholder));
             continue;
         }
-        for hunk in &file.hunks {
-            rows.push(SplitRow::Full(hunk_header(hunk)));
+        for (position, hunk) in patch.hunks.iter().enumerate() {
+            if position > 0 {
+                rows.push(SplitRow::Full(Row::Separator));
+            }
             rows.extend(pair(&hunk.lines).into_iter().map(|row| SplitRow::Sides {
                 left: row.left,
                 right: row.right,
@@ -93,6 +103,14 @@ mod tests {
             .collect()
     }
 
+    fn expanded() -> Collapsed {
+        Collapsed::new()
+    }
+
+    fn collapsed(files: impl IntoIterator<Item = usize>) -> Collapsed {
+        files.into_iter().collect()
+    }
+
     #[test]
     fn a_two_file_patch_yields_both_files_in_order_each_behind_its_own_header() {
         let patch = Patch {
@@ -102,12 +120,11 @@ mod tests {
             ],
         };
 
-        let rows = split_rows(&patch);
+        let rows = split_rows(&patch, &expanded());
 
         assert_eq!(paths(&rows), vec!["src/a.rs", "src/b.rs"]);
-        assert!(matches!(rows[1], SplitRow::Full(Row::HunkHeader { .. })));
-        assert!(matches!(rows[2], SplitRow::Sides { .. }));
-        assert_eq!(rows.len(), 6);
+        assert!(matches!(rows[1], SplitRow::Sides { .. }));
+        assert_eq!(rows.len(), 4);
     }
 
     #[test]
@@ -116,10 +133,10 @@ mod tests {
             files: vec![file("src/a.rs", vec![replacement()], false)],
         };
 
-        let rows = split_rows(&patch);
+        let rows = split_rows(&patch, &expanded());
 
-        let SplitRow::Sides { left, right } = &rows[2] else {
-            panic!("the third row is the paired line");
+        let SplitRow::Sides { left, right } = &rows[1] else {
+            panic!("the second row is the paired line");
         };
         assert_eq!(
             left.as_ref().map(|side| side.content.as_str()),
@@ -141,10 +158,10 @@ mod tests {
             )],
         };
 
-        let rows = split_rows(&patch);
+        let rows = split_rows(&patch, &expanded());
 
-        let SplitRow::Sides { left, right } = &rows[2] else {
-            panic!("the third row is the added line");
+        let SplitRow::Sides { left, right } = &rows[1] else {
+            panic!("the second row is the added line");
         };
         assert!(left.is_none());
         assert!(right.is_some());
@@ -165,10 +182,10 @@ mod tests {
             )],
         };
 
-        let rows = split_rows(&patch);
+        let rows = split_rows(&patch, &expanded());
 
-        let SplitRow::Sides { left, right } = &rows[2] else {
-            panic!("the third row is the deleted line");
+        let SplitRow::Sides { left, right } = &rows[1] else {
+            panic!("the second row is the deleted line");
         };
         assert!(left.is_some());
         assert!(right.is_none());
@@ -180,7 +197,7 @@ mod tests {
             files: vec![file("src/a.png", Vec::new(), true)],
         };
 
-        let rows = split_rows(&patch);
+        let rows = split_rows(&patch, &expanded());
 
         assert_eq!(
             rows[1],
@@ -197,7 +214,7 @@ mod tests {
             files: vec![file("src/a.rs", Vec::new(), false)],
         };
 
-        let rows = split_rows(&patch);
+        let rows = split_rows(&patch, &expanded());
 
         assert_eq!(
             rows[1],
@@ -217,16 +234,18 @@ mod tests {
             )],
         };
 
-        let rows = split_rows(&patch);
+        let rows = split_rows(&patch, &expanded());
 
         assert_eq!(paths(&rows), vec!["src/old.rs \u{2192} src/new.rs"]);
         assert_eq!(
             rows[0],
             SplitRow::Full(Row::FileHeader {
+                file: 0,
                 path: "src/old.rs \u{2192} src/new.rs".to_string(),
                 status: FileStatus::Renamed { similarity: 87 },
                 added: 0,
                 deleted: 0,
+                collapsed: false,
             })
         );
         assert_eq!(
@@ -247,30 +266,86 @@ mod tests {
             )],
         };
 
-        let rows = split_rows(&patch);
+        let rows = split_rows(&patch, &expanded());
 
         assert_eq!(
             rows[0],
             SplitRow::Full(Row::FileHeader {
+                file: 0,
                 path: "src/old.rs \u{2192} src/copy.rs".to_string(),
                 status: FileStatus::Copied { similarity: 100 },
                 added: 0,
                 deleted: 0,
+                collapsed: false,
             })
         );
     }
 
     #[test]
-    fn every_hunk_of_a_file_keeps_its_own_header() {
+    fn two_hunks_of_a_file_are_parted_by_a_single_separator() {
         let patch = Patch {
             files: vec![file("src/a.rs", vec![replacement(), replacement()], false)],
         };
 
-        let headers = split_rows(&patch)
-            .iter()
-            .filter(|row| matches!(row, SplitRow::Full(Row::HunkHeader { .. })))
-            .count();
+        let rows = split_rows(&patch, &expanded());
 
-        assert_eq!(headers, 2);
+        assert!(matches!(rows[0], SplitRow::Full(Row::FileHeader { .. })));
+        assert!(matches!(rows[1], SplitRow::Sides { .. }));
+        assert_eq!(rows[2], SplitRow::Full(Row::Separator));
+        assert!(matches!(rows[3], SplitRow::Sides { .. }));
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn a_collapsed_file_emits_its_header_and_nothing_else() {
+        let patch = Patch {
+            files: vec![file("src/a.rs", vec![replacement(), replacement()], false)],
+        };
+
+        let rows = split_rows(&patch, &collapsed([0]));
+
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0],
+            SplitRow::Full(Row::FileHeader {
+                collapsed: true,
+                ..
+            })
+        ));
+        assert!(!rows.contains(&SplitRow::Full(Row::Separator)));
+    }
+
+    #[test]
+    fn collapsing_one_file_leaves_the_others_whole() {
+        let patch = Patch {
+            files: vec![
+                file("src/a.rs", vec![replacement()], false),
+                file("src/b.rs", vec![replacement()], false),
+                file("src/c.rs", vec![replacement()], false),
+            ],
+        };
+
+        let rows = split_rows(&patch, &collapsed([1]));
+
+        assert_eq!(paths(&rows), vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(rows[1], SplitRow::Sides { .. }));
+        assert!(matches!(
+            rows[2],
+            SplitRow::Full(Row::FileHeader {
+                file: 1,
+                collapsed: true,
+                ..
+            })
+        ));
+        assert!(matches!(rows[4], SplitRow::Sides { .. }));
+    }
+
+    #[test]
+    fn a_collapsed_binary_file_drops_its_placeholder_too() {
+        let patch = Patch {
+            files: vec![file("src/a.png", Vec::new(), true)],
+        };
+        assert_eq!(split_rows(&patch, &collapsed([0])).len(), 1);
     }
 }

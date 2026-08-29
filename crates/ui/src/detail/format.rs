@@ -3,7 +3,7 @@
 //! Nothing here touches gpui's `App` or `Window`: every function is a plain transformation
 //! from domain types to strings, so it is testable without a running window.
 
-use domain::{Hunk, ObjectId, Timestamp};
+use domain::{ObjectId, Timestamp};
 
 /// Hexadecimal characters kept when an identifier is shown abbreviated, matching Git's
 /// own default abbreviation length.
@@ -79,36 +79,12 @@ pub fn escape_markdown(text: &str) -> String {
     escaped
 }
 
-/// A hunk's `@@ -old,len +new,len @@ heading` marker line.
-pub fn hunk_heading(hunk: &Hunk) -> String {
-    let marker = format!(
-        "@@ -{},{} +{},{} @@",
-        hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
-    );
-    if hunk.heading.is_empty() {
-        marker
-    } else {
-        format!("{marker} {}", hunk.heading)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn id(nibble: char) -> ObjectId {
         nibble.to_string().repeat(40).parse().unwrap()
-    }
-
-    fn hunk() -> Hunk {
-        Hunk {
-            old_start: 1,
-            old_lines: 1,
-            new_start: 1,
-            new_lines: 2,
-            heading: "fn existing()".to_string(),
-            lines: vec![],
-        }
     }
 
     #[test]
@@ -150,18 +126,6 @@ mod tests {
             offset_minutes: -300,
         };
         assert_eq!(format_timestamp(timestamp), "31 December 1999 at 19:00:00");
-    }
-
-    #[test]
-    fn hunk_heading_includes_the_function_context_when_git_found_one() {
-        assert_eq!(hunk_heading(&hunk()), "@@ -1,1 +1,2 @@ fn existing()");
-    }
-
-    #[test]
-    fn hunk_heading_omits_the_trailing_space_when_git_found_no_context() {
-        let mut hunk = hunk();
-        hunk.heading = String::new();
-        assert_eq!(hunk_heading(&hunk), "@@ -1,1 +1,2 @@");
     }
 
     #[test]

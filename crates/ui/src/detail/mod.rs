@@ -21,10 +21,13 @@
 //! string of every cell in them are derived from the patch, and deriving them per frame
 //! would copy every line of the patch two or three times over on every repaint —
 //! `refresh_window_on_change` repaints on each mouse move of a selection drag, so that is
-//! not a rare frame. They are rebuilt by [`DetailPanel::set_detail`] and
-//! [`DetailPanel::set_diff_view_mode`], which are the only two places the patch or the
-//! view mode can change. [`DetailPanel::selected_tab`] is never touched by `set_detail`,
-//! which is what lets picking a different commit leave the open tab alone.
+//! not a rare frame. They are rebuilt by [`DetailPanel::set_detail`],
+//! [`DetailPanel::set_diff_view_mode`] and [`DetailPanel::toggle_file`], the three places
+//! the patch, the view mode or the set of collapsed files can change.
+//! [`DetailPanel::selected_tab`] is never touched by `set_detail`, which is what lets
+//! picking a different commit leave the open tab alone. The collapsed set is cleared by
+//! `set_detail` rather than carried over: it names files by their index in the patch, and
+//! another commit's patch holds other files at those indices.
 //!
 //! The diff view mode is read once from disk in [`DetailPanel::new`], before the first
 //! frame, and written back through `cx.background_executor()`:
@@ -33,8 +36,12 @@
 //! than inline.
 //!
 //! Both `set_detail` and a mode change route through `DetailPanel::reset_diff_view`, which
-//! zeroes the diff's scroll offset and clears the window selection. Clearing is the reason
-//! both take a `&mut Window`, which is why [`crate::workspace::Workspace`] threads one into
+//! zeroes the diff's scroll offset and clears the window selection. Collapsing a file clears
+//! the selection as well but keeps the scroll offset — the rows the reader was looking at are
+//! still there — pulling it up only as far as the shortened content's last screenful,
+//! because the element chooses the rows to lay out from that offset one phase before the
+//! scrolling container gets to clamp it. Clearing is the reason all three take a
+//! `&mut Window`, which is why [`crate::workspace::Workspace`] threads one into
 //! `sync_panels_from_repository`. It is not optional: `gpui-base` stores a selection
 //! endpoint relative to the participant's registered origin (`text_selection.rs:1336`), so it
 //! survives the content underneath it changing, and a stored `y` then resolves onto whatever row now sits
@@ -42,8 +49,8 @@
 //! copy. `TextSelection::clear` is window-wide rather than per-participant, and this panel
 //! has participants beyond the diff body: [`metadata`] renders every value through
 //! [`gpui_component::text::markdown`], and each `TextView` registers one of its own. They
-//! are cleared too, which is the right outcome — they are selections over the commit that
-//! is being replaced.
+//! are cleared too, which is the right outcome — they are selections over content this panel
+//! is replacing.
 
 mod diff;
 mod format;
@@ -73,7 +80,7 @@ use crate::diff_view_mode::DiffViewMode;
 use crate::persistence;
 use crate::repository::{CommitDetail, LoadState};
 
-use diff::DiffContent;
+use diff::{Collapsed, DiffContent, ToggleFile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DetailTab {
@@ -104,6 +111,7 @@ impl DetailTab {
 pub struct DetailPanel {
     detail: LoadState<Arc<CommitDetail>>,
     diff_content: Option<Rc<DiffContent>>,
+    diff_collapsed: Collapsed,
     diff_selection: TextSelectionHandle,
     diff_select_all: bool,
     diff_auto_scroll: AutoScroll,
@@ -145,6 +153,7 @@ impl DetailPanel {
         Self {
             detail: LoadState::Idle,
             diff_content: None,
+            diff_collapsed: Collapsed::new(),
             diff_selection,
             diff_select_all: false,
             diff_auto_scroll: AutoScroll::default(),
@@ -163,8 +172,19 @@ impl DetailPanel {
         cx: &mut Context<Self>,
     ) {
         self.detail = detail;
+        self.diff_collapsed.clear();
         self.rebuild_diff_content();
         self.reset_diff_view(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_file(&mut self, file: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.diff_collapsed.remove(&file) {
+            self.diff_collapsed.insert(file);
+        }
+        self.rebuild_diff_content();
+        self.clear_diff_selection(window, cx);
+        self.clamp_diff_scroll();
         cx.notify();
     }
 
@@ -194,18 +214,36 @@ impl DetailPanel {
 
     fn rebuild_diff_content(&mut self) {
         self.diff_content = match &self.detail {
-            LoadState::Ready(detail) => {
-                Some(Rc::new(diff::content(&detail.patch, self.diff_view_mode)))
-            }
+            LoadState::Ready(detail) => Some(Rc::new(diff::content(
+                &detail.patch,
+                self.diff_view_mode,
+                &self.diff_collapsed,
+            ))),
             _ => None,
         };
     }
 
     fn reset_diff_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_diff_selection(window, cx);
+        self.diff_scroll_handle.set_offset(Point::default());
+    }
+
+    fn clear_diff_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.diff_auto_scroll.stop();
         self.diff_select_all = false;
-        self.diff_scroll_handle.set_offset(Point::default());
         TextSelection::clear(window, cx);
+    }
+
+    fn clamp_diff_scroll(&mut self) {
+        let height = self
+            .diff_content
+            .as_ref()
+            .map_or(px(0.), |content| content.height());
+        let lowest = -(height - self.diff_scroll_handle.bounds().size.height).max(px(0.));
+        let offset = self.diff_scroll_handle.offset();
+        if offset.y < lowest {
+            self.diff_scroll_handle.set_offset(point(offset.x, lowest));
+        }
     }
 
     fn forget_select_all(&mut self, cx: &mut Context<Self>) {
@@ -278,6 +316,9 @@ impl Render for DetailPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_tab = self.selected_tab;
         let diff_view_mode = self.diff_view_mode;
+        let toggle_file: ToggleFile = Rc::new(cx.listener(|this, file: &usize, window, cx| {
+            this.toggle_file(*file, window, cx);
+        }));
         div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_copy))
@@ -298,6 +339,7 @@ impl Render for DetailPanel {
                     &self.diff_selection,
                     &self.general_scroll_handle,
                     &self.diff_scroll_handle,
+                    toggle_file,
                     cx,
                 ),
             })
@@ -398,6 +440,7 @@ fn ready_state(
     diff_selection: &TextSelectionHandle,
     general_scroll_handle: &ScrollHandle,
     diff_scroll_handle: &ScrollHandle,
+    toggle_file: ToggleFile,
     cx: &App,
 ) -> AnyElement {
     match selected_tab {
@@ -407,6 +450,7 @@ fn ready_state(
             diff_select_all,
             diff_selection,
             diff_scroll_handle,
+            toggle_file,
             cx,
         ),
     }
@@ -442,6 +486,7 @@ fn diff_tab(
     select_all: bool,
     selection: &TextSelectionHandle,
     scroll_handle: &ScrollHandle,
+    toggle_file: ToggleFile,
     cx: &App,
 ) -> AnyElement {
     div()
@@ -453,6 +498,7 @@ fn diff_tab(
             select_all,
             selection,
             scroll_handle,
+            toggle_file,
             cx,
         ))
         .into_any_element()
