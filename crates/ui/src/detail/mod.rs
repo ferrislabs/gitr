@@ -1,5 +1,6 @@
 //! The right dock's commit detail panel: a tab bar switching between commit metadata and
-//! the diff, above whichever of the two is selected.
+//! the diff, above whichever of the two is selected. A second segmented bar sits beside it
+//! while the diff is open, choosing between the unified and the side-by-side view.
 //!
 //! [`DetailPanel`] renders exactly the [`LoadState`] it is handed — it never reads a
 //! repository itself. [`metadata::render_header`] and [`metadata::render_description`]
@@ -22,6 +23,13 @@
 //! derived from the patch during the render that follows.
 //! [`DetailPanel::selected_tab`] is never touched by `set_detail`, which is what lets
 //! picking a different commit leave the open tab alone.
+//!
+//! The diff view mode is read once from disk in [`DetailPanel::new`], before the first
+//! frame, and written back through `cx.background_executor()`:
+//! [`crate::persistence::save_diff_view_mode`] blocks on file I/O and a toggle is a frame
+//! event, so it is saved the way [`crate::workspace::Workspace`] saves the theme rather
+//! than inline. Switching modes also zeroes the diff's scroll offset, as `set_detail` does,
+//! because a row index means something different in each view.
 
 mod diff;
 mod format;
@@ -32,7 +40,7 @@ use std::sync::Arc;
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, ParentElement as _, Point, Render, ScrollHandle, StatefulInteractiveElement as _,
-    Styled as _, Window, div,
+    Styled as _, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_base::TextSelectionHandle;
 use gpui_component::{
@@ -44,6 +52,8 @@ use gpui_component::{
     tab::{Tab, TabBar},
 };
 
+use crate::diff_view_mode::DiffViewMode;
+use crate::persistence;
 use crate::repository::{CommitDetail, LoadState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -75,6 +85,7 @@ impl DetailTab {
 pub struct DetailPanel {
     detail: LoadState<Arc<CommitDetail>>,
     diff_selection: TextSelectionHandle,
+    diff_view_mode: DiffViewMode,
     selected_tab: DetailTab,
     general_scroll_handle: ScrollHandle,
     diff_scroll_handle: ScrollHandle,
@@ -88,6 +99,7 @@ impl DetailPanel {
         Self {
             detail: LoadState::Idle,
             diff_selection,
+            diff_view_mode: persistence::load_diff_view_mode().unwrap_or_default(),
             selected_tab: DetailTab::default(),
             general_scroll_handle: ScrollHandle::new(),
             diff_scroll_handle: ScrollHandle::new(),
@@ -98,6 +110,24 @@ impl DetailPanel {
     pub fn set_detail(&mut self, detail: LoadState<Arc<CommitDetail>>, cx: &mut Context<Self>) {
         self.detail = detail;
         self.diff_scroll_handle.set_offset(Point::default());
+        cx.notify();
+    }
+
+    fn set_diff_view_mode(&mut self, mode: DiffViewMode, cx: &mut Context<Self>) {
+        if mode == self.diff_view_mode {
+            return;
+        }
+        self.diff_view_mode = mode;
+        self.diff_scroll_handle.set_offset(Point::default());
+
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) = persistence::save_diff_view_mode(&mode) {
+                    eprintln!("gitr: failed to save diff view mode: {error:#}");
+                }
+            })
+            .detach();
+
         cx.notify();
     }
 }
@@ -127,11 +157,12 @@ impl Focusable for DetailPanel {
 impl Render for DetailPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_tab = self.selected_tab;
+        let diff_view_mode = self.diff_view_mode;
         div()
             .size_full()
             .flex()
             .flex_col()
-            .child(tab_bar(selected_tab, cx))
+            .child(tab_bar(selected_tab, diff_view_mode, cx))
             .child(match &self.detail {
                 LoadState::Idle => centered_message(cx, "Select a commit to see its details."),
                 LoadState::Loading => loading_state(cx),
@@ -139,6 +170,7 @@ impl Render for DetailPanel {
                 LoadState::Ready(detail) => ready_state(
                     detail,
                     selected_tab,
+                    diff_view_mode,
                     &self.diff_selection,
                     &self.general_scroll_handle,
                     &self.diff_scroll_handle,
@@ -148,7 +180,11 @@ impl Render for DetailPanel {
     }
 }
 
-fn tab_bar(selected: DetailTab, cx: &mut Context<DetailPanel>) -> AnyElement {
+fn tab_bar(
+    selected: DetailTab,
+    diff_view_mode: DiffViewMode,
+    cx: &mut Context<DetailPanel>,
+) -> AnyElement {
     let mut tabs = TabBar::new("detail-tabs")
         .segmented()
         .small()
@@ -163,6 +199,7 @@ fn tab_bar(selected: DetailTab, cx: &mut Context<DetailPanel>) -> AnyElement {
 
     div()
         .flex_shrink_0()
+        .flex()
         .items_center()
         .gap_2()
         .px_2()
@@ -170,7 +207,24 @@ fn tab_bar(selected: DetailTab, cx: &mut Context<DetailPanel>) -> AnyElement {
         .border_b_1()
         .border_color(cx.theme().border)
         .child(tabs)
+        .when(selected == DetailTab::Diff, |row| {
+            row.child(diff_view_mode_bar(diff_view_mode, cx))
+        })
         .into_any_element()
+}
+
+fn diff_view_mode_bar(selected: DiffViewMode, cx: &mut Context<DetailPanel>) -> AnyElement {
+    let mut modes = TabBar::new("diff-view-mode")
+        .segmented()
+        .small()
+        .selected_index(selected.index())
+        .on_click(cx.listener(|this, index: &usize, _, cx| {
+            this.set_diff_view_mode(DiffViewMode::from_index(*index), cx);
+        }));
+    for mode in DiffViewMode::ALL {
+        modes = modes.child(Tab::new().label(mode.label()));
+    }
+    modes.into_any_element()
 }
 
 fn centered_message(cx: &App, message: &str) -> AnyElement {
@@ -214,6 +268,7 @@ fn failed_state(message: &str) -> AnyElement {
 fn ready_state(
     detail: &CommitDetail,
     selected_tab: DetailTab,
+    diff_view_mode: DiffViewMode,
     diff_selection: &TextSelectionHandle,
     general_scroll_handle: &ScrollHandle,
     diff_scroll_handle: &ScrollHandle,
@@ -221,7 +276,13 @@ fn ready_state(
 ) -> AnyElement {
     match selected_tab {
         DetailTab::General => general_tab(detail, general_scroll_handle, cx),
-        DetailTab::Diff => diff_tab(detail, diff_selection, diff_scroll_handle, cx),
+        DetailTab::Diff => diff_tab(
+            detail,
+            diff_view_mode,
+            diff_selection,
+            diff_scroll_handle,
+            cx,
+        ),
     }
 }
 
@@ -252,6 +313,7 @@ fn general_tab(detail: &CommitDetail, scroll_handle: &ScrollHandle, cx: &App) ->
 
 fn diff_tab(
     detail: &CommitDetail,
+    mode: DiffViewMode,
     selection: &TextSelectionHandle,
     scroll_handle: &ScrollHandle,
     cx: &App,
@@ -260,6 +322,12 @@ fn diff_tab(
         .flex_1()
         .min_h_0()
         .min_w_0()
-        .child(diff::render(&detail.patch, selection, scroll_handle, cx))
+        .child(diff::render(
+            &detail.patch,
+            mode,
+            selection,
+            scroll_handle,
+            cx,
+        ))
         .into_any_element()
 }

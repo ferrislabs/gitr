@@ -1,4 +1,4 @@
-use domain::{DiffLine, FilePatch, LineOrigin, Patch};
+use domain::{DiffLine, FilePatch, Hunk, LineOrigin, Patch};
 
 use crate::detail::format;
 
@@ -25,39 +25,53 @@ pub(super) enum Row {
 pub(super) fn rows(patch: &Patch) -> Vec<Row> {
     let mut rows = Vec::new();
     for file in &patch.files {
-        rows.push(Row::FileHeader {
-            path: file
-                .display_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            stat: file_stat(file),
-        });
+        rows.push(file_header(file));
         push_body(&mut rows, file);
     }
     rows
+}
+
+pub(super) fn file_header(file: &FilePatch) -> Row {
+    Row::FileHeader {
+        path: file
+            .display_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        stat: file_stat(file),
+    }
 }
 
 pub(super) fn file_stat(file: &FilePatch) -> String {
     format!("+{} \u{2212}{}", file.added_lines(), file.deleted_lines())
 }
 
-fn push_body(rows: &mut Vec<Row>, file: &FilePatch) {
+pub(super) fn placeholder(file: &FilePatch) -> Option<Row> {
     if file.is_binary {
-        rows.push(Row::Placeholder {
+        return Some(Row::Placeholder {
             message: "Binary file not shown.",
         });
-        return;
     }
     if file.hunks.is_empty() {
-        rows.push(Row::Placeholder {
+        return Some(Row::Placeholder {
             message: "No content changes.",
         });
+    }
+    None
+}
+
+pub(super) fn hunk_header(hunk: &Hunk) -> Row {
+    Row::HunkHeader {
+        text: format::hunk_heading(hunk),
+    }
+}
+
+fn push_body(rows: &mut Vec<Row>, file: &FilePatch) {
+    if let Some(placeholder) = placeholder(file) {
+        rows.push(placeholder);
         return;
     }
     for hunk in &file.hunks {
-        rows.push(Row::HunkHeader {
-            text: format::hunk_heading(hunk),
-        });
+        rows.push(hunk_header(hunk));
         rows.extend(hunk.lines.iter().map(line_row));
     }
 }

@@ -10,10 +10,20 @@
 //! carried. All three follow from the diff being one text document, so the rows are built
 //! here instead — see the design note under `docs/superpowers/specs/`.
 //!
+//! A row carries one cell in [`DiffViewMode::Unified`] and two in [`DiffViewMode::Split`],
+//! which is the only difference between the two views: [`body::Rows`] answers how many
+//! columns a body has, and every horizontal position — the content width, a cell's bounds,
+//! a gutter's origin — is that column's share of the element's width. A file, hunk or
+//! placeholder row keeps one full-width cell in either view, so the columns stay uniform
+//! and a cell is `row * columns + column` rather than a lookup. Because a column is laid
+//! out against `content_width / columns` and the width is measured over every cell, a
+//! full-width header still fits in the half it is drawn in.
+//!
 //! Selection comes back through `gpui-base`'s window-level participant system rather than
 //! from the editor. [`body`] is the element that joins it: it registers one participant and
-//! declares one run per row on screen, and only the code text becomes a run — the gutters
-//! and the marker are painted directly and never registered, which is what keeps line
+//! declares one run per cell on screen, left before right within a row, and only the code
+//! text becomes a run — the gutters and the marker are painted directly and never
+//! registered, which is what keeps line
 //! numbers and markers out of the clipboard. The rows scroll on both axes rather than soft-wrapping,
 //! matching GitHub. `restrict_scroll_to_axis` still earns its place here, but not for the
 //! reason it usually does: the container's `overflow_scroll()` puts both axes in
@@ -38,25 +48,29 @@
 //! bottom edge would come back holding only the rows that happened to be on screen, and
 //! nothing would report that it had been cut short. `body::DiffBody::copy_selection` derives
 //! the row span from the selection's own window points instead — `body::selected_rows` — and
-//! asks `body::selection_band` and `body::selected_range` for each row's byte range, shaping
-//! only the at most two rows whose ends the selection cuts through; every row between them is
-//! whole. Endpoints survive scrolling because `gpui-base` stores them relative to
+//! asks `body::selection_band` and `body::selected_range` for each cell's byte range, shaping
+//! only the cells of the at most two rows whose ends the selection cuts through; every row
+//! between them is whole. A band is a property of the row, so both cells of a row share it
+//! and a cell's own column offset is what turns it into a range — which is exactly what
+//! `point_in_selection_band` does to two runs that share a `y`, so the arithmetic and the
+//! projection still agree cell for cell. Endpoints survive scrolling because `gpui-base`
+//! stores them relative to
 //! `bounds.origin`, which already carries the scroll, so a point off the top of the viewport
 //! is a negative `y` rather than a lost one. Rows that *are* on screen keep the projection's
 //! own range, so what is highlighted and what is copied cannot drift apart.
 //!
 //! What stays unwindowed is the content width: `body::DiffBody::content_width` shapes every
-//! row on every layout pass, because the horizontal scroll extent has to consider rows that
+//! cell on every layout pass, because the horizontal scroll extent has to consider rows that
 //! are not on screen or the scrollbar would resize as the view scrolls vertically, and
-//! because the children are laid out against a width that provably exceeds every row's
+//! because a cell is laid out against a column width that provably exceeds every cell's
 //! natural width — which is what keeps a row one line tall and `ROW_HEIGHT` true. After the
 //! first frame those are hits in gpui's line-layout cache, so the cost is a hash of each
-//! row's bytes rather than a reshape.
+//! cell's bytes rather than a reshape.
 //!
 //! Copying depends on a fact `gpui-base`'s own doc comment does not state. A participant's
 //! runs concatenate with no separator when `update_runs` projects them
 //! (`text_selection.rs:593`); only whole participants are joined with `"\n"`
-//! (`resolve_copy_items`, `:513`). So the row separator is computed here, in
+//! (`resolve_copy_items`, `:513`). So the separators are computed here, in
 //! [`body::copy_text`], and published through `TextSelectionHandle::set_fallback_copy_text`
 //! right after `update_runs` — which works only because that setter also clears
 //! `projected_copy_text` (`:559`), the field `update_runs` just set, so `copy_item` falls
@@ -64,12 +78,22 @@
 //! default branch pinned solely by `Cargo.lock`; if that clearing behaviour ever moves,
 //! copying silently goes back to gluing rows together with no separator, and nothing fails
 //! to say so.
+//!
+//! A row ends with `"\n"` and a column with `"\t"`, which makes a split copy the table the
+//! reader is looking at. The alternative — a newline between the two columns as well — was
+//! rejected because the band rule takes both cells of every row a selection passes through
+//! whole, so a drag down one column still copies the other; newlines would interleave the
+//! two sides and repeat every context line, and neither separator can yield compilable code
+//! out of a two-column view. Narrowing the copy to one column was rejected for a harder
+//! reason: the highlight comes from the projection, and dropping a cell the projection
+//! selected is exactly the drift between clipboard and screen the paragraph above exists to
+//! prevent.
 
 mod body;
 mod model;
-#[allow(dead_code)]
 mod pairing;
 mod palette;
+mod split;
 
 use domain::Patch;
 use gpui::{
@@ -82,11 +106,15 @@ use gpui_component::{
     scroll::{ScrollableElement as _, ScrollbarAxis},
 };
 
-use body::{ROW_HEIGHT, body};
+use crate::diff_view_mode::DiffViewMode;
+
+use body::{ROW_HEIGHT, Rows, body};
 use model::rows;
+use split::split_rows;
 
 pub(super) fn render(
     patch: &Patch,
+    mode: DiffViewMode,
     selection: &TextSelectionHandle,
     scroll: &ScrollHandle,
     cx: &App,
@@ -101,6 +129,11 @@ pub(super) fn render(
             .child("This commit changes nothing.")
             .into_any_element();
     }
+
+    let content = match mode {
+        DiffViewMode::Unified => Rows::Unified(rows(patch)),
+        DiffViewMode::Split => Rows::Split(split_rows(patch)),
+    };
 
     let theme = cx.theme();
     div()
@@ -117,7 +150,7 @@ pub(super) fn render(
                 .text_size(theme.mono_font_size)
                 .line_height(px(ROW_HEIGHT))
                 .child(body(
-                    rows(patch),
+                    content,
                     selection.clone(),
                     scroll.clone(),
                     theme.colors,

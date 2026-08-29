@@ -11,7 +11,9 @@ use gpui_base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun
 use gpui_component::{ThemeColor, ThemeMode};
 
 use super::model::Row;
+use super::pairing::SideLine;
 use super::palette::line_colors;
+use super::split::SplitRow;
 
 pub(super) const ROW_HEIGHT: f32 = 18.;
 
@@ -20,10 +22,58 @@ const MARKER_WIDTH: f32 = 16.;
 const GUTTER_PADDING: f32 = 8.;
 const MARKER_PADDING: f32 = 5.;
 const CODE_LEFT: f32 = 2. * GUTTER_WIDTH + MARKER_WIDTH;
+const SPLIT_CODE_LEFT: f32 = GUTTER_WIDTH + MARKER_WIDTH;
+const COLUMN_RULE_WIDTH: f32 = 1.;
 const TRAILING_SPACE: f32 = 16.;
 
+pub(super) enum Rows {
+    Unified(Vec<Row>),
+    Split(Vec<SplitRow>),
+}
+
+impl Rows {
+    fn len(&self) -> usize {
+        match self {
+            Rows::Unified(rows) => rows.len(),
+            Rows::Split(rows) => rows.len(),
+        }
+    }
+
+    fn columns(&self) -> usize {
+        match self {
+            Rows::Unified(_) => 1,
+            Rows::Split(_) => 2,
+        }
+    }
+
+    fn code_left(&self) -> f32 {
+        match self {
+            Rows::Unified(_) => CODE_LEFT,
+            Rows::Split(_) => SPLIT_CODE_LEFT,
+        }
+    }
+
+    fn cells(&self) -> usize {
+        self.len() * self.columns()
+    }
+
+    fn side(&self, row: usize, column: usize) -> Option<&SideLine> {
+        let Rows::Split(rows) = self else {
+            return None;
+        };
+        let SplitRow::Sides { left, right } = &rows[row] else {
+            return None;
+        };
+        if column == 0 {
+            left.as_ref()
+        } else {
+            right.as_ref()
+        }
+    }
+}
+
 pub(super) struct DiffBody {
-    rows: Vec<Row>,
+    rows: Rows,
     strings: Vec<SharedString>,
     selection: TextSelectionHandle,
     scroll: ScrollHandle,
@@ -31,17 +81,19 @@ pub(super) struct DiffBody {
     mode: ThemeMode,
     visible: Range<usize>,
     texts: Vec<StyledText>,
-    row_bounds: Vec<Bounds<Pixels>>,
+    cell_bounds: Vec<Bounds<Pixels>>,
 }
 
 pub(super) fn body(
-    rows: Vec<Row>,
+    rows: Rows,
     selection: TextSelectionHandle,
     scroll: ScrollHandle,
     theme: ThemeColor,
     mode: ThemeMode,
 ) -> DiffBody {
-    let strings: Vec<SharedString> = rows.iter().map(row_text).collect();
+    let strings: Vec<SharedString> = (0..rows.cells())
+        .map(|cell| cell_text(&rows, cell))
+        .collect();
     DiffBody {
         rows,
         strings,
@@ -51,7 +103,25 @@ pub(super) fn body(
         mode,
         visible: 0..0,
         texts: Vec::new(),
-        row_bounds: Vec::new(),
+        cell_bounds: Vec::new(),
+    }
+}
+
+fn cell_text(rows: &Rows, cell: usize) -> SharedString {
+    let columns = rows.columns();
+    let (row, column) = (cell / columns, cell % columns);
+    match rows {
+        Rows::Unified(rows) => row_text(&rows[row]),
+        Rows::Split(split) => match &split[row] {
+            SplitRow::Full(full) if column == 0 => row_text(full),
+            SplitRow::Full(_) => SharedString::default(),
+            SplitRow::Sides { left, right } => {
+                let side = if column == 0 { left } else { right };
+                side.as_ref()
+                    .map(|side| SharedString::from(side.content.clone()))
+                    .unwrap_or_default()
+            }
+        },
     }
 }
 
@@ -64,13 +134,34 @@ fn row_text(row: &Row) -> SharedString {
     }
 }
 
-fn styled_row(row: &Row, text: SharedString, theme: &ThemeColor, mode: ThemeMode) -> StyledText {
+fn styled_cell(
+    rows: &Rows,
+    cell: usize,
+    text: SharedString,
+    theme: &ThemeColor,
+    mode: ThemeMode,
+) -> StyledText {
     let range = 0..text.len();
     let highlight = HighlightStyle {
-        color: Some(row_foreground(row, theme, mode)),
+        color: Some(cell_foreground(rows, cell, theme, mode)),
         ..Default::default()
     };
     StyledText::new(text).with_highlights([(range, highlight)])
+}
+
+fn cell_foreground(rows: &Rows, cell: usize, theme: &ThemeColor, mode: ThemeMode) -> Hsla {
+    let columns = rows.columns();
+    let (row, column) = (cell / columns, cell % columns);
+    match rows {
+        Rows::Unified(rows) => row_foreground(&rows[row], theme, mode),
+        Rows::Split(split) => match &split[row] {
+            SplitRow::Full(full) => row_foreground(full, theme, mode),
+            SplitRow::Sides { .. } => rows
+                .side(row, column)
+                .map(|side| line_colors(side.origin, mode, theme).foreground)
+                .unwrap_or(theme.foreground),
+        },
+    }
 }
 
 fn row_foreground(row: &Row, theme: &ThemeColor, mode: ThemeMode) -> Hsla {
@@ -224,7 +315,12 @@ fn selected_range(
     range
 }
 
-fn copy_text(strings: &[SharedString], ranges: &[Option<Range<usize>>]) -> String {
+fn copy_text(
+    strings: &[SharedString],
+    ranges: &[Option<Range<usize>>],
+    start: usize,
+    columns: usize,
+) -> String {
     let (Some(first), Some(last)) = (
         ranges.iter().position(Option::is_some),
         ranges.iter().rposition(Option::is_some),
@@ -232,15 +328,20 @@ fn copy_text(strings: &[SharedString], ranges: &[Option<Range<usize>>]) -> Strin
         return String::new();
     };
 
-    strings[first..=last]
-        .iter()
-        .zip(&ranges[first..=last])
-        .map(|(text, range)| match range {
-            Some(range) => &text[range.clone()],
-            None => "",
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut text = String::new();
+    for cell in first..=last {
+        if cell > first {
+            text.push(if (start + cell).is_multiple_of(columns) {
+                '\n'
+            } else {
+                '\t'
+            });
+        }
+        if let Some(range) = &ranges[cell] {
+            text.push_str(&strings[cell][range.clone()]);
+        }
+    }
+    text
 }
 
 fn paint_selection(layout: &TextLayout, range: Range<usize>, color: Hsla, window: &mut Window) {
@@ -312,17 +413,27 @@ impl DiffBody {
         for text in &self.strings {
             widest = widest.max(pen.width(text.clone(), window));
         }
-        px(CODE_LEFT) + widest + px(TRAILING_SPACE)
+        (px(self.rows.code_left()) + widest + px(TRAILING_SPACE)) * self.rows.columns() as f32
     }
 
-    fn bounds_for_row(&self, bounds: Bounds<Pixels>, index: usize) -> Bounds<Pixels> {
+    fn column_width(&self, bounds: Bounds<Pixels>) -> Pixels {
+        bounds.size.width / self.rows.columns() as f32
+    }
+
+    fn column_left(&self, bounds: Bounds<Pixels>, column: usize) -> Pixels {
+        bounds.origin.x + self.column_width(bounds) * column as f32
+    }
+
+    fn bounds_for_cell(&self, bounds: Bounds<Pixels>, cell: usize) -> Bounds<Pixels> {
+        let columns = self.rows.columns();
+        let code_left = px(self.rows.code_left());
         Bounds::new(
             point(
-                bounds.origin.x + px(CODE_LEFT),
-                bounds.origin.y + px(index as f32 * ROW_HEIGHT),
+                self.column_left(bounds, cell % columns) + code_left,
+                bounds.origin.y + px((cell / columns) as f32 * ROW_HEIGHT),
             ),
             size(
-                (bounds.size.width - px(CODE_LEFT)).max(px(0.)),
+                (self.column_width(bounds) - code_left).max(px(0.)),
                 px(ROW_HEIGHT),
             ),
         )
@@ -334,6 +445,11 @@ impl DiffBody {
             self.scroll.bounds().size.height,
             self.rows.len(),
         )
+    }
+
+    fn visible_cells(&self) -> Range<usize> {
+        let columns = self.rows.columns();
+        self.visible.start * columns..self.visible.end * columns
     }
 
     fn copy_selection(
@@ -362,72 +478,140 @@ impl DiffBody {
             return String::new();
         };
 
-        let left = bounds.origin.x + px(CODE_LEFT);
-        let ranges: Vec<Option<Range<usize>>> = rows
+        let columns = self.rows.columns();
+        let visible = self.visible_cells();
+        let cells = rows.start() * columns..(rows.end() + 1) * columns;
+        let ranges: Vec<Option<Range<usize>>> = cells
             .clone()
-            .map(|index| {
-                if self.visible.contains(&index) {
-                    return projected
-                        .get(index - self.visible.start)
-                        .and_then(Clone::clone);
+            .map(|cell| {
+                if visible.contains(&cell) {
+                    return projected.get(cell - visible.start).and_then(Clone::clone);
                 }
-                let row_top = bounds.origin.y + px(index as f32 * ROW_HEIGHT);
-                let band = selection_band(row_top, anchor, cursor)?;
-                let text = &self.strings[index];
-                selected_range(text, band, left, || pen.measure(text.clone(), window))
+                let cell_bounds = self.bounds_for_cell(bounds, cell);
+                let band = selection_band(cell_bounds.origin.y, anchor, cursor)?;
+                let text = &self.strings[cell];
+                selected_range(text, band, cell_bounds.origin.x, || {
+                    pen.measure(text.clone(), window)
+                })
             })
             .collect();
 
-        copy_text(&self.strings[rows], &ranges)
+        copy_text(&self.strings[cells.clone()], &ranges, cells.start, columns)
+    }
+
+    fn paint_background(
+        &self,
+        row: usize,
+        bounds: Bounds<Pixels>,
+        top: Pixels,
+        window: &mut Window,
+    ) {
+        let full_width = match &self.rows {
+            Rows::Unified(rows) => Some(&rows[row]),
+            Rows::Split(split) => match &split[row] {
+                SplitRow::Full(full) => Some(full),
+                SplitRow::Sides { .. } => None,
+            },
+        };
+
+        match full_width {
+            Some(full) => {
+                if let Some(background) = row_background(full, &self.theme, self.mode) {
+                    let band = Bounds::new(
+                        point(bounds.origin.x, top),
+                        size(bounds.size.width, px(ROW_HEIGHT)),
+                    );
+                    window.paint_quad(fill(band, background));
+                }
+            }
+            None => {
+                for column in 0..self.rows.columns() {
+                    let Some(background) = self.rows.side(row, column).and_then(|side| {
+                        line_colors(side.origin, self.mode, &self.theme).background
+                    }) else {
+                        continue;
+                    };
+                    let band = Bounds::new(
+                        point(self.column_left(bounds, column), top),
+                        size(self.column_width(bounds), px(ROW_HEIGHT)),
+                    );
+                    window.paint_quad(fill(band, background));
+                }
+            }
+        }
+
+        for column in 1..self.rows.columns() {
+            let rule = Bounds::new(
+                point(self.column_left(bounds, column), top),
+                size(px(COLUMN_RULE_WIDTH), px(ROW_HEIGHT)),
+            );
+            window.paint_quad(fill(rule, self.theme.border));
+        }
     }
 
     fn paint_gutter(
         &self,
-        index: usize,
-        left: Pixels,
-        top: Pixels,
+        row: usize,
+        column: usize,
+        cell_bounds: Bounds<Pixels>,
         pen: &Pen,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Row::Line {
-            origin,
-            old_number,
-            new_number,
-            ..
-        } = self.rows[index]
-        else {
-            return;
-        };
-
+        let left = cell_bounds.origin.x - px(self.rows.code_left());
+        let top = cell_bounds.origin.y;
         let muted = self.theme.muted_foreground;
-        paint_number(
-            old_number,
-            left + px(GUTTER_WIDTH),
-            top,
-            muted,
-            pen,
-            window,
-            cx,
-        );
-        paint_number(
-            new_number,
-            left + px(2. * GUTTER_WIDTH),
-            top,
-            muted,
-            pen,
-            window,
-            cx,
-        );
+        let (origin, marker_left) = match &self.rows {
+            Rows::Unified(rows) => {
+                let Row::Line {
+                    origin,
+                    old_number,
+                    new_number,
+                    ..
+                } = rows[row]
+                else {
+                    return;
+                };
+                paint_number(
+                    old_number,
+                    left + px(GUTTER_WIDTH),
+                    top,
+                    muted,
+                    pen,
+                    window,
+                    cx,
+                );
+                paint_number(
+                    new_number,
+                    left + px(2. * GUTTER_WIDTH),
+                    top,
+                    muted,
+                    pen,
+                    window,
+                    cx,
+                );
+                (origin, left + px(2. * GUTTER_WIDTH + MARKER_PADDING))
+            }
+            Rows::Split(_) => {
+                let Some(side) = self.rows.side(row, column) else {
+                    return;
+                };
+                paint_number(
+                    side.number,
+                    left + px(GUTTER_WIDTH),
+                    top,
+                    muted,
+                    pen,
+                    window,
+                    cx,
+                );
+                (side.origin, left + px(GUTTER_WIDTH + MARKER_PADDING))
+            }
+        };
 
         let foreground = line_colors(origin, self.mode, &self.theme).foreground;
         let line = pen.shape(marker(origin).into(), foreground, window);
-        paint_line(
-            &line,
-            point(left + px(2. * GUTTER_WIDTH + MARKER_PADDING), top),
-            window,
-            cx,
-        );
+        paint_line(&line, point(marker_left, top), window, cx);
     }
 }
 
@@ -460,12 +644,12 @@ impl Element for DiffBody {
     ) -> (LayoutId, Self::RequestLayoutState) {
         self.visible = self.visible_rows();
         self.texts = self
-            .visible
-            .clone()
-            .map(|index| {
-                styled_row(
-                    &self.rows[index],
-                    self.strings[index].clone(),
+            .visible_cells()
+            .map(|cell| {
+                styled_cell(
+                    &self.rows,
+                    cell,
+                    self.strings[cell].clone(),
                     &self.theme,
                     self.mode,
                 )
@@ -499,20 +683,19 @@ impl Element for DiffBody {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        self.row_bounds = self
-            .visible
-            .clone()
-            .map(|index| self.bounds_for_row(bounds, index))
+        self.cell_bounds = self
+            .visible_cells()
+            .map(|cell| self.bounds_for_cell(bounds, cell))
             .collect();
-        for (text, row_bounds) in self.texts.iter_mut().zip(&self.row_bounds) {
-            text.prepaint(None, None, *row_bounds, &mut (), window, cx);
+        for (text, cell_bounds) in self.texts.iter_mut().zip(&self.cell_bounds) {
+            text.prepaint(None, None, *cell_bounds, &mut (), window, cx);
         }
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         self.selection.register(
             TextSelectionRegistration::new(hitbox.clone(), bounds)
                 .with_document_order(0)
-                .with_text_bounds(self.row_bounds.clone()),
+                .with_text_bounds(self.cell_bounds.clone()),
             window,
             cx,
         );
@@ -529,18 +712,19 @@ impl Element for DiffBody {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let first_cell = self.visible_cells().start;
         let runs: Vec<TextSelectionRun> = self
             .texts
             .iter()
             .enumerate()
             .map(|(offset, text)| {
-                let index = self.visible.start + offset;
+                let cell = first_cell + offset;
                 TextSelectionRun::new(
-                    self.strings[index].clone(),
+                    self.strings[cell].clone(),
                     text.layout().clone(),
-                    self.row_bounds[offset],
+                    self.cell_bounds[offset],
                 )
-                .with_document_order(index as u64)
+                .with_document_order(cell as u64)
             })
             .collect();
         let projection = self.selection.update_runs(&runs, cx);
@@ -549,29 +733,34 @@ impl Element for DiffBody {
         let selected = self.copy_selection(bounds, projection.ranges(), &pen, window, cx);
         self.selection.set_fallback_copy_text(selected, cx);
 
-        for (offset, index) in self.visible.clone().enumerate() {
-            let row_bounds = self.row_bounds[offset];
-            let top = row_bounds.origin.y;
+        let columns = self.rows.columns();
+        for (offset, row) in self.visible.clone().enumerate() {
+            let top = self.cell_bounds[offset * columns].origin.y;
+            self.paint_background(row, bounds, top, window);
 
-            if let Some(background) = row_background(&self.rows[index], &self.theme, self.mode) {
-                let band = Bounds::new(
-                    point(bounds.origin.x, top),
-                    size(bounds.size.width, px(ROW_HEIGHT)),
-                );
-                window.paint_quad(fill(band, background));
-            }
+            for column in 0..columns {
+                let cell_offset = offset * columns + column;
+                let cell_bounds = self.cell_bounds[cell_offset];
+                if let Some(range) = projection.ranges().get(cell_offset).and_then(Clone::clone) {
+                    paint_selection(
+                        self.texts[cell_offset].layout(),
+                        range,
+                        self.theme.selection,
+                        window,
+                    );
+                }
 
-            if let Some(range) = projection.ranges().get(offset).and_then(Clone::clone) {
-                paint_selection(
-                    self.texts[offset].layout(),
-                    range,
-                    self.theme.selection,
+                self.paint_gutter(row, column, cell_bounds, &pen, window, cx);
+                self.texts[cell_offset].paint(
+                    None,
+                    None,
+                    cell_bounds,
+                    &mut (),
+                    &mut (),
                     window,
+                    cx,
                 );
             }
-
-            self.paint_gutter(index, bounds.origin.x, top, &pen, window, cx);
-            self.texts[offset].paint(None, None, row_bounds, &mut (), &mut (), window, cx);
         }
     }
 }
@@ -588,7 +777,7 @@ mod tests {
             SharedString::from("three"),
         ];
         let ranges = vec![Some(1..3), Some(0..3), None];
-        assert_eq!(copy_text(&strings, &ranges), "ne\ntwo");
+        assert_eq!(copy_text(&strings, &ranges, 0, 1), "ne\ntwo");
     }
 
     #[test]
@@ -599,13 +788,55 @@ mod tests {
             SharedString::from("three"),
         ];
         let ranges = vec![Some(0..3), None, Some(0..5)];
-        assert_eq!(copy_text(&strings, &ranges), "one\n\nthree");
+        assert_eq!(copy_text(&strings, &ranges, 0, 1), "one\n\nthree");
     }
 
     #[test]
     fn copy_text_of_an_empty_projection_is_empty() {
         let strings = vec![SharedString::from("one")];
-        assert_eq!(copy_text(&strings, &[None]), "");
+        assert_eq!(copy_text(&strings, &[None], 0, 1), "");
+    }
+
+    #[test]
+    fn copy_text_separates_two_columns_of_the_same_row_with_a_tab() {
+        let strings = vec![
+            SharedString::from("gone"),
+            SharedString::from("new"),
+            SharedString::from("keep"),
+            SharedString::from("keep"),
+        ];
+        let ranges = vec![Some(0..4), Some(0..3), Some(0..4), Some(0..4)];
+        assert_eq!(copy_text(&strings, &ranges, 0, 2), "gone\tnew\nkeep\tkeep");
+    }
+
+    #[test]
+    fn copy_text_of_a_padded_column_inside_the_selection_keeps_its_empty_field() {
+        let strings = vec![
+            SharedString::from("gone"),
+            SharedString::from(""),
+            SharedString::from("keep"),
+            SharedString::from("keep"),
+        ];
+        let ranges = vec![Some(0..4), None, Some(0..4), Some(0..4)];
+        assert_eq!(copy_text(&strings, &ranges, 0, 2), "gone\t\nkeep\tkeep");
+    }
+
+    #[test]
+    fn copy_text_starts_at_the_first_selected_column_rather_than_at_a_leading_pad() {
+        let strings = vec![SharedString::from(""), SharedString::from("new")];
+        let ranges = vec![None, Some(0..3)];
+        assert_eq!(copy_text(&strings, &ranges, 0, 2), "new");
+    }
+
+    #[test]
+    fn copy_text_of_a_span_starting_mid_row_keeps_the_row_boundaries_aligned() {
+        let strings = vec![
+            SharedString::from("new"),
+            SharedString::from("keep"),
+            SharedString::from("keep"),
+        ];
+        let ranges = vec![Some(0..3), Some(0..4), Some(0..4)];
+        assert_eq!(copy_text(&strings, &ranges, 1, 2), "new\nkeep\tkeep");
     }
 
     #[test]
