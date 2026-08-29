@@ -1,7 +1,7 @@
 use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
 
-use domain::{FileStatus, LineOrigin};
+use domain::FileStatus;
 use gpui::{
     App, Bounds, DispatchPhase, Element, ElementId, FlexDirection, FontWeight, GlobalElementId,
     Half as _, HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
@@ -14,18 +14,16 @@ use gpui_component::{ThemeColor, ThemeMode, scroll::Scrollbar};
 
 use super::model::{Row, header_line};
 use super::pairing::SideLine;
-use super::palette::line_colors;
+use super::palette::line_background;
 use super::split::SplitRow;
 use super::{DiffContent, ToggleFile};
 
 pub(super) const ROW_HEIGHT: f32 = 18.;
 
 const GUTTER_WIDTH: f32 = 44.;
-const MARKER_WIDTH: f32 = 16.;
 const GUTTER_PADDING: f32 = 8.;
-const MARKER_PADDING: f32 = 5.;
-const CODE_LEFT: f32 = 2. * GUTTER_WIDTH + MARKER_WIDTH;
-const SPLIT_CODE_LEFT: f32 = GUTTER_WIDTH + MARKER_WIDTH;
+const CODE_LEFT: f32 = 2. * GUTTER_WIDTH;
+const SPLIT_CODE_LEFT: f32 = GUTTER_WIDTH;
 const COLUMN_RULE_WIDTH: f32 = 1.;
 const TRAILING_SPACE: f32 = 16.;
 const UNMEASURED_ROWS: usize = 100;
@@ -93,10 +91,6 @@ impl Rows {
 
     fn cells(&self) -> usize {
         self.len() * self.columns()
-    }
-
-    fn marker_left(&self) -> f32 {
-        self.code_left() - MARKER_WIDTH + MARKER_PADDING
     }
 
     fn full(&self, row: usize) -> Option<&Row> {
@@ -230,15 +224,7 @@ fn row_background(row: &Row, theme: &ThemeColor, mode: ThemeMode) -> Option<Hsla
         Row::FileHeader { .. } => Some(theme.secondary),
         Row::Separator => Some(theme.muted),
         Row::Placeholder { .. } => None,
-        Row::Line { origin, .. } => line_colors(*origin, mode, theme).background,
-    }
-}
-
-fn marker(origin: LineOrigin) -> &'static str {
-    match origin {
-        LineOrigin::Addition => "+",
-        LineOrigin::Deletion => "\u{2212}",
-        LineOrigin::Context => " ",
+        Row::Line { origin, .. } => line_background(*origin, mode),
     }
 }
 
@@ -725,9 +711,11 @@ impl DiffBody {
             }
             None => {
                 for column in 0..columns {
-                    let Some(background) = self.rows().side(row, column).and_then(|side| {
-                        line_colors(side.origin, self.mode, &self.theme).background
-                    }) else {
+                    let Some(background) = self
+                        .rows()
+                        .side(row, column)
+                        .and_then(|side| line_background(side.origin, self.mode))
+                    else {
                         continue;
                     };
                     let band = Bounds::new(
@@ -759,13 +747,11 @@ impl DiffBody {
     ) {
         let left = cell_bounds.origin.x - px(self.rows().code_left());
         let top = cell_bounds.origin.y;
-        let marker_left = left + px(self.rows().marker_left());
         let muted = self.theme.muted_foreground;
 
-        let origin = match self.rows() {
+        match self.rows() {
             Rows::Unified(rows) => {
                 let Row::Line {
-                    origin,
                     old_number,
                     new_number,
                     ..
@@ -791,7 +777,6 @@ impl DiffBody {
                     window,
                     cx,
                 );
-                origin
             }
             Rows::Split(_) => {
                 let Some(side) = self.rows().side(row, column) else {
@@ -806,13 +791,8 @@ impl DiffBody {
                     window,
                     cx,
                 );
-                side.origin
             }
-        };
-
-        let marker_color = line_colors(origin, self.mode, &self.theme).foreground;
-        let line = pen.shape(marker(origin).into(), marker_color, window);
-        paint_line(&line, point(marker_left, top), window, cx);
+        }
     }
 
     fn paint_header(
@@ -1085,6 +1065,7 @@ impl Element for DiffBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::LineOrigin;
 
     fn file_header() -> Row {
         Row::FileHeader {
@@ -1139,11 +1120,11 @@ mod tests {
     }
 
     #[test]
-    fn a_marker_sits_in_the_last_gutter_a_view_has() {
+    fn code_starts_immediately_after_the_gutters_a_view_has() {
         let unified = Rows::Unified(vec![file_header()]);
 
-        assert_eq!(unified.marker_left(), 2. * GUTTER_WIDTH + MARKER_PADDING);
-        assert_eq!(split_rows().marker_left(), GUTTER_WIDTH + MARKER_PADDING);
+        assert_eq!(unified.code_left(), 2. * GUTTER_WIDTH);
+        assert_eq!(split_rows().code_left(), GUTTER_WIDTH);
     }
 
     #[test]
@@ -1432,7 +1413,7 @@ mod tests {
         assert_eq!(
             row_text(&collapsed),
             row_text(&file_header()),
-            "the marker is painted in the gutter, so no run and no copy can carry it"
+            "the chevron is painted beside the path, so no run and no copy can carry it"
         );
     }
 
@@ -1441,13 +1422,6 @@ mod tests {
         let rows = split_rows();
         assert_eq!(cell_text(&rows, 2), SharedString::from("gone"));
         assert_eq!(cell_text(&rows, 3), SharedString::default());
-    }
-
-    #[test]
-    fn a_marker_names_the_origin_and_a_context_line_keeps_the_column_wide() {
-        assert_eq!(marker(LineOrigin::Addition), "+");
-        assert_eq!(marker(LineOrigin::Deletion), "\u{2212}");
-        assert_eq!(marker(LineOrigin::Context), " ");
     }
 
     #[test]
@@ -1479,7 +1453,7 @@ mod tests {
         );
         assert_eq!(
             row_background(&line(LineOrigin::Addition, "new"), &theme, mode),
-            line_colors(LineOrigin::Addition, mode, &theme).background
+            line_background(LineOrigin::Addition, mode)
         );
     }
 
@@ -1498,23 +1472,31 @@ mod tests {
         let bounds = Bounds::new(point(px(10.), px(20.)), size(px(200.), px(400.)));
 
         assert_eq!(
-            bounds_for_cell(bounds, 2, px(60.), 3),
+            bounds_for_cell(bounds, 2, px(SPLIT_CODE_LEFT), 3),
             Bounds::new(
-                point(px(170.), px(20. + ROW_HEIGHT)),
-                size(px(40.), px(ROW_HEIGHT))
+                point(px(110. + SPLIT_CODE_LEFT), px(20. + ROW_HEIGHT)),
+                size(px(100. - SPLIT_CODE_LEFT), px(ROW_HEIGHT))
             ),
             "cell 3 is the right column of the second row"
         );
         assert_eq!(
-            bounds_for_cell(bounds, 1, px(104.), 0),
-            Bounds::new(point(px(114.), px(20.)), size(px(96.), px(ROW_HEIGHT)))
+            bounds_for_cell(bounds, 1, px(CODE_LEFT), 0),
+            Bounds::new(
+                point(px(10. + CODE_LEFT), px(20.)),
+                size(px(200. - CODE_LEFT), px(ROW_HEIGHT))
+            )
         );
     }
 
     #[test]
     fn a_column_narrower_than_its_gutters_leaves_no_width_rather_than_a_negative_one() {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(80.), px(400.)));
-        assert_eq!(bounds_for_cell(bounds, 2, px(60.), 0).size.width, px(0.));
+        assert_eq!(
+            bounds_for_cell(bounds, 2, px(SPLIT_CODE_LEFT), 0)
+                .size
+                .width,
+            px(0.)
+        );
     }
 
     #[test]

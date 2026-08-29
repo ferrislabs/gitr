@@ -7,8 +7,9 @@
 //! full-width row background outside the cursor line, so an addition's tint hugs the glyphs
 //! and a blank added line gets none at all; and it has no per-line element hook to work
 //! around either. The `+`/`-` markers were carrying the signal the colour only half
-//! carried. All three follow from the diff being one text document, so the rows are built
-//! here instead — see the design note under `docs/superpowers/specs/`.
+//! carried; a full-width tint carries it whole, so this view draws no markers at all. All
+//! three follow from the diff being one text document, so the rows are built here instead —
+//! see the design note under `docs/superpowers/specs/`.
 //!
 //! A row carries one cell in [`DiffViewMode::Unified`] and two in [`DiffViewMode::Split`],
 //! which is the only difference between the two views: [`body::Rows`] answers how many
@@ -44,10 +45,10 @@
 //! from the editor. [`body`] is the element that joins it: it registers one participant and
 //! declares one run per cell on screen, left before right within a row, and only the code
 //! text — or, on a file header, the path alone — becomes a run. Everything else a row draws
-//! is painted directly and never registered: a line's gutters and its `+`/`−` marker, and a
-//! header's disclosure chevron, status pastille, change bar and change count. That is what
-//! keeps line numbers, markers and a file's statistics out of the clipboard, and it is why
-//! copying a header yields a bare path. The code rows scroll on both axes rather than
+//! is painted directly and never registered: a line's two gutters, and a header's disclosure
+//! chevron, status pastille, change bar and change count. That is what keeps line numbers and
+//! a file's statistics out of the clipboard, and it is why copying a header yields a bare
+//! path. The code rows scroll on both axes rather than
 //! soft-wrapping,
 //! matching GitHub. `restrict_scroll_to_axis` still earns its place here, but not for the
 //! reason it usually does: the container's `overflow_scroll()` puts both axes in
