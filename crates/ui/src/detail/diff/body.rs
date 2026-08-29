@@ -12,7 +12,7 @@ use gpui::{
 use gpui_base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
 use gpui_component::{ThemeColor, ThemeMode, scroll::Scrollbar};
 
-use super::model::{Row, header_line};
+use super::model::Row;
 use super::pairing::SideLine;
 use super::palette::line_background;
 use super::split::SplitRow;
@@ -191,7 +191,7 @@ fn cell_text(rows: &Rows, cell: usize) -> SharedString {
 
 fn row_text(row: &Row) -> SharedString {
     match row {
-        Row::FileHeader { path, .. } => header_line(path).into(),
+        Row::FileHeader { path, .. } => path.clone().into(),
         Row::Separator => SharedString::default(),
         Row::Line { content, .. } => content.clone().into(),
         Row::Placeholder { message } => (*message).into(),
@@ -264,6 +264,14 @@ fn header_budget(viewport: Pixels) -> Option<Pixels> {
     }
     let furniture = px(HEADER_TEXT_LEFT + HEADER_STATS_WIDTH) + Scrollbar::width();
     Some((viewport - furniture).max(px(0.)))
+}
+
+fn count_right_edge(frame_right: Pixels) -> Pixels {
+    frame_right - Scrollbar::width() - px(HEADER_PADDING)
+}
+
+fn bar_right_edge(frame_right: Pixels, count_width: Pixels) -> Pixels {
+    count_right_edge(frame_right) - px(BAR_GAP) - px(COUNT_WIDTH).max(count_width)
 }
 
 fn elide_path(path: &str, budget: f32, width: impl Fn(&str) -> f32) -> Option<String> {
@@ -668,15 +676,25 @@ impl DiffBody {
         let columns = self.rows().columns();
         let visible = self.visible_cells();
         let cells = rows.start() * columns..(rows.end() + 1) * columns;
+        let displayed = |cell: usize| {
+            visible
+                .contains(&cell)
+                .then(|| self.display.get(cell - visible.start))
+                .flatten()
+        };
         let texts: Vec<SharedString> = cells
             .clone()
-            .map(|cell| self.cell_string(cell, pen, window))
+            .map(|cell| {
+                displayed(cell)
+                    .cloned()
+                    .unwrap_or_else(|| self.cell_string(cell, pen, window))
+            })
             .collect();
         let ranges: Vec<Option<Range<usize>>> = cells
             .clone()
             .enumerate()
             .map(|(offset, cell)| {
-                if visible.contains(&cell) {
+                if displayed(cell).is_some() {
                     return projected.get(cell - visible.start).and_then(Clone::clone);
                 }
                 let cell_bounds = self.cell_bounds_at(bounds, cell);
@@ -844,13 +862,13 @@ impl DiffBody {
             self.theme.foreground,
             window,
         );
-        let count_right = frame.right() - Scrollbar::width() - px(HEADER_PADDING);
+        let count_right = count_right_edge(frame.right());
         paint_line(&count, point(count_right - count.width(), top), window, cx);
 
         let Some(bar) = bar_widths(*added, *deleted, self.content.max_changes) else {
             return;
         };
-        let bar_right = count_right - px(BAR_GAP) - px(COUNT_WIDTH).max(count.width());
+        let bar_right = bar_right_edge(frame.right(), count.width());
         let bar_left = bar_right - px(bar.added + bar.deleted);
         let bar_top = top + px(BAR_TOP);
         for (offset, width, color) in [
@@ -1253,22 +1271,32 @@ mod tests {
             Some("\u{2026}23456789".to_string()),
             "one character over budget drops two, since the ellipsis takes one"
         );
+        assert_eq!(
+            elide_path("d\u{e9}tail.rs", 5., monospace),
+            Some("\u{2026}l.rs".to_string()),
+            "the cut is a byte offset that lands on a character boundary, not a char count"
+        );
     }
 
     #[test]
     fn an_elided_path_never_exceeds_the_budget_it_was_given() {
-        let path = "crates/ui/src/detail/diff/body.rs";
-        for budget in 2..=40 {
-            let budget = budget as f32;
-            let elided = elide_path(path, budget, monospace).unwrap_or_else(|| path.to_string());
-            assert!(
-                monospace(&elided) <= budget,
-                "{elided:?} overruns a budget of {budget}"
-            );
-            assert!(
-                path.ends_with(elided.trim_start_matches(ELLIPSIS)),
-                "{elided:?} is not a tail of {path:?}"
-            );
+        for path in [
+            "crates/ui/src/detail/diff/body.rs",
+            "crates/ui/src/d\u{e9}tail/diff/b\u{f4}dy.rs",
+        ] {
+            for budget in 2..=40 {
+                let budget = budget as f32;
+                let elided =
+                    elide_path(path, budget, monospace).unwrap_or_else(|| path.to_string());
+                assert!(
+                    monospace(&elided) <= budget,
+                    "{elided:?} overruns a budget of {budget}"
+                );
+                assert!(
+                    path.ends_with(elided.trim_start_matches(ELLIPSIS)),
+                    "{elided:?} is not a tail of {path:?}"
+                );
+            }
         }
     }
 
@@ -1294,6 +1322,24 @@ mod tests {
         let narrow = header_budget(px(600.)).expect("a measured viewport has a budget");
         assert_eq!(wide - narrow, px(400.), "the furniture is a fixed width");
         assert!(narrow > px(0.));
+    }
+
+    #[test]
+    fn the_path_budget_stops_a_gap_short_of_the_leftmost_bar_the_painter_can_draw() {
+        let width = px(1000.);
+        let budget = header_budget(width).expect("a measured viewport has a budget");
+        let path_right = px(HEADER_TEXT_LEFT) + budget;
+
+        assert_eq!(
+            bar_right_edge(width, px(0.)) - px(BAR_WIDTH) - path_right,
+            px(BAR_GAP),
+            "the budget and the painter derive the same clearance from the same constants"
+        );
+        assert_eq!(
+            bar_right_edge(width, px(COUNT_WIDTH + BAR_GAP)) - px(BAR_WIDTH) - path_right,
+            px(0.),
+            "a count wider than its column eats the gap before it reaches the path"
+        );
     }
 
     #[test]

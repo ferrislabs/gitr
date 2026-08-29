@@ -47,10 +47,6 @@ pub(super) fn file_header(index: usize, file: &FilePatch, collapsed: bool) -> Ro
     }
 }
 
-pub(super) fn header_line(path: &str) -> String {
-    path.to_string()
-}
-
 pub(super) fn max_changes(patch: &Patch) -> usize {
     patch
         .files
@@ -261,13 +257,11 @@ mod tests {
             panic!("a file yields a header row");
         };
 
-        assert_eq!(path, "src/old.rs \u{2192} src/new.rs");
-        assert_eq!(status, FileStatus::Renamed { similarity: 87 });
         assert_eq!(
-            header_line(&path),
-            "src/old.rs \u{2192} src/new.rs",
+            path, "src/old.rs \u{2192} src/new.rs",
             "the similarity rides on the status, which is painted as a pastille"
         );
+        assert_eq!(status, FileStatus::Renamed { similarity: 87 });
     }
 
     #[test]
@@ -283,7 +277,6 @@ mod tests {
 
         assert_eq!(path, "src/old.rs \u{2192} src/copy.rs");
         assert_eq!(status, FileStatus::Copied { similarity: 100 });
-        assert_eq!(header_line(&path), "src/old.rs \u{2192} src/copy.rs");
     }
 
     #[test]
@@ -300,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn a_header_line_carries_the_path_and_nothing_else() {
+    fn a_header_carries_the_path_and_nothing_else() {
         let patch = Patch {
             files: vec![file(vec![one_line()], false)],
         };
@@ -317,8 +310,7 @@ mod tests {
         assert_eq!(added, 1);
         assert_eq!(deleted, 0);
         assert_eq!(
-            header_line(&path),
-            "src/main.rs",
+            path, "src/main.rs",
             "the counts are painted, so a run cannot copy them with the path"
         );
     }
@@ -430,8 +422,7 @@ mod tests {
 
         assert!(collapsed);
         assert_eq!(
-            header_line(&path),
-            "src/main.rs",
+            path, "src/main.rs",
             "the disclosure chevron is painted, because a run would copy it"
         );
     }

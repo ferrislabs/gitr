@@ -48,9 +48,8 @@
 //! is painted directly and never registered: a line's two gutters, and a header's disclosure
 //! chevron, status pastille, change bar and change count. That is what keeps line numbers and
 //! a file's statistics out of the clipboard, and it is why copying a header yields a bare
-//! path. The code rows scroll on both axes rather than
-//! soft-wrapping,
-//! matching GitHub. `restrict_scroll_to_axis` still earns its place here, but not for the
+//! path. The code rows scroll on both axes rather than soft-wrapping, matching GitHub.
+//! `restrict_scroll_to_axis` still earns its place here, but not for the
 //! reason it usually does: the container's `overflow_scroll()` puts both axes in
 //! `Overflow::Scroll`, and gpui's vertical-onto-horizontal remap (`div.rs:3220-3224`,
 //! `:3229-3233`) only fires when one axis is *not* `Overflow::Scroll`, so that remap is
@@ -81,12 +80,12 @@
 //! projection still agree cell for cell. Endpoints survive scrolling because `gpui-base`
 //! stores them relative to `bounds.origin + scroll_offset`, and the participant reports the
 //! two so that their sum is this element's own origin, which already carries the scroll: a
-//! point off the top of the viewport is then a negative `y` rather than a lost one. Rows
-//! that *are* on screen keep the projection's
-//! own range, so what is highlighted and what is copied cannot drift apart. Select All is
-//! the one selection with no window points to derive anything from — it is participant-local
-//! (`set_local_selection`), so `copy_selection` answers the whole document for it directly
-//! and every visible cell is highlighted whole.
+//! point off the top of the viewport is then a negative `y` rather than a lost one. Rows that
+//! *are* on screen keep both the projection's range and the string it was measured against,
+//! read out of the one `display` array the runs were declared from, so what is highlighted and
+//! what is copied cannot drift apart. Select All is the one selection with no window points to
+//! derive anything from — it is participant-local (`set_local_selection`), so `copy_selection`
+//! answers the whole document for it directly and every visible cell is highlighted whole.
 //!
 //! What stays unwindowed is the content width: `body::DiffBody::content_width` shapes every
 //! cell on every layout pass, because the horizontal scroll extent has to consider rows that
@@ -102,9 +101,9 @@
 //! exception in one respect: its elision binary-searches the tail against the shaped width,
 //! so it allocates a handful of candidates per header per frame. They are the same
 //! candidates every frame, so they settle into the same cache, and there are at most a
-//! screenful of headers — but it is a search, not a lookup. That last number is
-//! the scale every header's change bar is drawn against, and it belongs to the derivation for
-//! the same reason the strings do: a bar is a share of the widest file in the patch, so
+//! screenful of headers — but it is a search, not a lookup. The largest file's total changes
+//! is the scale every header's change bar is drawn against, and it belongs to the derivation
+//! for the same reason the strings do: a bar is a share of the widest file in the patch, so
 //! sizing one from the element would mean walking every file of the patch on every frame.
 //! Collapsing is applied in that same derivation — the body rows of a collapsed file are
 //! never emitted — so the element windows, paints and selects over a shorter list and knows
