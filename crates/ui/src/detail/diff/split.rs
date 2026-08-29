@@ -141,6 +141,30 @@ mod tests {
     }
 
     #[test]
+    fn a_pure_deletion_leaves_the_right_column_empty_rather_than_collapsing_the_row() {
+        let patch = Patch {
+            files: vec![file(
+                "src/a.rs",
+                vec![hunk(vec![line(
+                    LineOrigin::Deletion,
+                    Some(1),
+                    None,
+                    "gone",
+                )])],
+                false,
+            )],
+        };
+
+        let rows = split_rows(&patch);
+
+        let SplitRow::Sides { left, right } = &rows[2] else {
+            panic!("the third row is the deleted line");
+        };
+        assert!(left.is_some());
+        assert!(right.is_none());
+    }
+
+    #[test]
     fn a_binary_file_yields_a_full_width_placeholder_instead_of_columns() {
         let patch = Patch {
             files: vec![file("src/a.png", Vec::new(), true)],

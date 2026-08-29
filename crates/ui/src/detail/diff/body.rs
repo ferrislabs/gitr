@@ -537,15 +537,15 @@ impl DiffBody {
                     );
                     window.paint_quad(fill(band, background));
                 }
-            }
-        }
 
-        for column in 1..self.rows.columns() {
-            let rule = Bounds::new(
-                point(self.column_left(bounds, column), top),
-                size(px(COLUMN_RULE_WIDTH), px(ROW_HEIGHT)),
-            );
-            window.paint_quad(fill(rule, self.theme.border));
+                for column in 1..self.rows.columns() {
+                    let rule = Bounds::new(
+                        point(self.column_left(bounds, column), top),
+                        size(px(COLUMN_RULE_WIDTH), px(ROW_HEIGHT)),
+                    );
+                    window.paint_quad(fill(rule, self.theme.border));
+                }
+            }
         }
     }
 

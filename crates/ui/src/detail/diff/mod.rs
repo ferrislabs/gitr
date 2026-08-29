@@ -23,8 +23,8 @@
 //! from the editor. [`body`] is the element that joins it: it registers one participant and
 //! declares one run per cell on screen, left before right within a row, and only the code
 //! text becomes a run — the gutters and the marker are painted directly and never
-//! registered, which is what keeps line
-//! numbers and markers out of the clipboard. The rows scroll on both axes rather than soft-wrapping,
+//! registered, which is what keeps line numbers and markers out of the clipboard. The rows
+//! scroll on both axes rather than soft-wrapping,
 //! matching GitHub. `restrict_scroll_to_axis` still earns its place here, but not for the
 //! reason it usually does: the container's `overflow_scroll()` puts both axes in
 //! `Overflow::Scroll`, and gpui's vertical-onto-horizontal remap (`div.rs:3220-3224`,
@@ -54,8 +54,8 @@
 //! and a cell's own column offset is what turns it into a range — which is exactly what
 //! `point_in_selection_band` does to two runs that share a `y`, so the arithmetic and the
 //! projection still agree cell for cell. Endpoints survive scrolling because `gpui-base`
-//! stores them relative to
-//! `bounds.origin`, which already carries the scroll, so a point off the top of the viewport
+//! stores them relative to `bounds.origin`, which already carries the scroll, so a point off
+//! the top of the viewport
 //! is a negative `y` rather than a lost one. Rows that *are* on screen keep the projection's
 //! own range, so what is highlighted and what is copied cannot drift apart.
 //!

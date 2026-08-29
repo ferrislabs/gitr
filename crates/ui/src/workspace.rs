@@ -295,7 +295,7 @@ impl Workspace {
 
         let this = cx.entity().downgrade();
         history_panel.update(cx, |panel, cx| panel.set_workspace(this, cx));
-        sync_panels_from_repository(&repository, &history_panel, &detail_panel, cx);
+        sync_panels_from_repository(&repository, &history_panel, &detail_panel, window, cx);
 
         let repository_subscription =
             cx.subscribe_in(&repository, window, Self::on_repository_event);
@@ -668,7 +668,7 @@ impl Workspace {
             RepositoryEvent::SelectionChanged => {
                 let detail = repository.read(cx).detail().clone();
                 self.detail_panel
-                    .update(cx, |panel, cx| panel.set_detail(detail, cx));
+                    .update(cx, |panel, cx| panel.set_detail(detail, window, cx));
                 if repository.read(cx).selected().is_none() {
                     self.dismiss_detail(window, cx);
                 }
@@ -825,7 +825,13 @@ impl Workspace {
         let (path, watch) = repository_path_and_watch(&project.source);
 
         let repository = cx.new(|cx| RepositoryState::open(path, watch, cx));
-        sync_panels_from_repository(&repository, &self.history_panel, &self.detail_panel, cx);
+        sync_panels_from_repository(
+            &repository,
+            &self.history_panel,
+            &self.detail_panel,
+            window,
+            cx,
+        );
         self.history_panel
             .update(cx, |panel, cx| panel.reset_for_new_repository(cx));
 
@@ -1293,6 +1299,7 @@ fn sync_panels_from_repository(
     repository: &Entity<RepositoryState>,
     history_panel: &Entity<HistoryPanel>,
     detail_panel: &Entity<DetailPanel>,
+    window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
     let history = repository.read(cx).history().clone();
@@ -1303,7 +1310,7 @@ fn sync_panels_from_repository(
         panel.set_history(history, cx);
         panel.set_head(deletion, head_commit(&head), cx);
     });
-    detail_panel.update(cx, |panel, cx| panel.set_detail(detail, cx));
+    detail_panel.update(cx, |panel, cx| panel.set_detail(detail, window, cx));
 }
 
 fn deletion_context(repository: &Entity<RepositoryState>, cx: &App) -> Deletion {

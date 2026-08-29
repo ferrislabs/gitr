@@ -28,8 +28,17 @@
 //! frame, and written back through `cx.background_executor()`:
 //! [`crate::persistence::save_diff_view_mode`] blocks on file I/O and a toggle is a frame
 //! event, so it is saved the way [`crate::workspace::Workspace`] saves the theme rather
-//! than inline. Switching modes also zeroes the diff's scroll offset, as `set_detail` does,
-//! because a row index means something different in each view.
+//! than inline.
+//!
+//! Both `set_detail` and a mode change route through `DetailPanel::reset_diff_view`, which
+//! zeroes the diff's scroll offset and clears the window selection. Clearing is the reason
+//! both take a `&mut Window`, which is why [`crate::workspace::Workspace`] threads one into
+//! `sync_panels_from_repository`. It is not optional: `gpui-base` stores a selection
+//! endpoint relative to `bounds.origin` (`text_selection.rs:1336`), so it survives the
+//! content underneath it changing, and a stored `y` then resolves onto whatever row now sits
+//! at that offset — a highlight over lines the user never dragged across, which Cmd-C would
+//! copy. `TextSelection::clear` is window-wide rather than per-participant, which costs
+//! nothing here because the diff body is the only participant this crate registers.
 
 mod diff;
 mod format;
@@ -42,7 +51,7 @@ use gpui::{
     IntoElement, ParentElement as _, Point, Render, ScrollHandle, StatefulInteractiveElement as _,
     Styled as _, Window, div, prelude::FluentBuilder as _,
 };
-use gpui_base::TextSelectionHandle;
+use gpui_base::{TextSelection, TextSelectionHandle};
 use gpui_component::{
     ActiveTheme as _, Sizable as _,
     alert::Alert,
@@ -107,18 +116,28 @@ impl DetailPanel {
         }
     }
 
-    pub fn set_detail(&mut self, detail: LoadState<Arc<CommitDetail>>, cx: &mut Context<Self>) {
+    pub fn set_detail(
+        &mut self,
+        detail: LoadState<Arc<CommitDetail>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.detail = detail;
-        self.diff_scroll_handle.set_offset(Point::default());
+        self.reset_diff_view(window, cx);
         cx.notify();
     }
 
-    fn set_diff_view_mode(&mut self, mode: DiffViewMode, cx: &mut Context<Self>) {
+    fn set_diff_view_mode(
+        &mut self,
+        mode: DiffViewMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if mode == self.diff_view_mode {
             return;
         }
         self.diff_view_mode = mode;
-        self.diff_scroll_handle.set_offset(Point::default());
+        self.reset_diff_view(window, cx);
 
         cx.background_executor()
             .spawn(async move {
@@ -129,6 +148,11 @@ impl DetailPanel {
             .detach();
 
         cx.notify();
+    }
+
+    fn reset_diff_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.diff_scroll_handle.set_offset(Point::default());
+        TextSelection::clear(window, cx);
     }
 }
 
@@ -218,8 +242,8 @@ fn diff_view_mode_bar(selected: DiffViewMode, cx: &mut Context<DetailPanel>) -> 
         .segmented()
         .small()
         .selected_index(selected.index())
-        .on_click(cx.listener(|this, index: &usize, _, cx| {
-            this.set_diff_view_mode(DiffViewMode::from_index(*index), cx);
+        .on_click(cx.listener(|this, index: &usize, window, cx| {
+            this.set_diff_view_mode(DiffViewMode::from_index(*index), window, cx);
         }));
     for mode in DiffViewMode::ALL {
         modes = modes.child(Tab::new().label(mode.label()));
