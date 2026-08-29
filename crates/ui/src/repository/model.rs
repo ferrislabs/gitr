@@ -32,6 +32,12 @@ impl<T> LoadState<T> {
         matches!(self, Self::Loading)
     }
 
+    pub fn start_reload(&mut self) {
+        if self.ready().is_none() {
+            *self = Self::Loading;
+        }
+    }
+
     pub fn error(&self) -> Option<&str> {
         match self {
             Self::Failed(message) => Some(message),
@@ -295,6 +301,34 @@ mod tests {
         assert_eq!(index.local_branches.len(), 1);
         assert_eq!(index.remote_branches.len(), 1);
         assert_eq!(index.tags.len(), 1);
+    }
+
+    #[test]
+    fn a_reload_keeps_a_value_that_is_already_loaded() {
+        let mut state: LoadState<u8> = LoadState::Ready(1);
+        state.start_reload();
+        assert_eq!(state, LoadState::Ready(1));
+    }
+
+    #[test]
+    fn a_first_load_has_nothing_to_keep() {
+        let mut state: LoadState<u8> = LoadState::Idle;
+        state.start_reload();
+        assert_eq!(state, LoadState::Loading);
+    }
+
+    #[test]
+    fn a_reload_after_a_failure_has_nothing_to_keep() {
+        let mut state: LoadState<u8> = LoadState::Failed("boom".into());
+        state.start_reload();
+        assert_eq!(state, LoadState::Loading);
+    }
+
+    #[test]
+    fn a_reload_that_overtakes_another_stays_loading() {
+        let mut state: LoadState<u8> = LoadState::Loading;
+        state.start_reload();
+        assert_eq!(state, LoadState::Loading);
     }
 
     #[test]

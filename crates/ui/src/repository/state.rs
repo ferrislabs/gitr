@@ -159,7 +159,7 @@ impl RepositoryState {
     /// immediately (`gpui::Task` semantics) — a later call always wins over an earlier one
     /// that has not yet applied its result.
     fn reload_head(&mut self, cx: &mut Context<Self>) {
-        self.head = LoadState::Loading;
+        self.head.start_reload();
         cx.notify();
         let path = self.path.clone();
         self.head_task = Some(cx.spawn(async move |this, cx| {
@@ -172,7 +172,7 @@ impl RepositoryState {
     }
 
     fn reload_references(&mut self, cx: &mut Context<Self>) {
-        self.references = LoadState::Loading;
+        self.references.start_reload();
         cx.notify();
         let path = self.path.clone();
         self.references_task = Some(cx.spawn(async move |this, cx| {
@@ -187,7 +187,7 @@ impl RepositoryState {
     /// The graph layout is computed in the same background closure as the walk that
     /// produces the commits it lays out, never after the result reaches the foreground.
     fn reload_history(&mut self, cx: &mut Context<Self>) {
-        self.history = LoadState::Loading;
+        self.history.start_reload();
         cx.notify();
         let path = self.path.clone();
         let scope = self.filter.scope.clone();
