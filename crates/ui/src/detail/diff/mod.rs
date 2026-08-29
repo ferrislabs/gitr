@@ -21,6 +21,8 @@
 
 #[allow(dead_code)]
 mod model;
+#[allow(dead_code)]
+mod pairing;
 
 use domain::Patch;
 use gpui::{AnyElement, App, Entity, IntoElement, ParentElement as _, Styled as _, div};
