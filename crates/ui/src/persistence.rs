@@ -15,12 +15,14 @@ use std::path::{Path, PathBuf};
 
 use gpui_component::dock::DockAreaState;
 
+use crate::diff_view_mode::DiffViewMode;
 use crate::project::ProjectList;
 use crate::theme_preference::ThemePreference;
 
 const APPLICATION_SUPPORT_DIR: &str = "Library/Application Support/gitr";
 const DOCK_LAYOUT_FILE: &str = "dock-layout.json";
 const THEME_PREFERENCE_FILE: &str = "theme-preference.json";
+const DIFF_VIEW_MODE_FILE: &str = "diff-view-preference.json";
 const PROJECTS_FILE: &str = "projects.json";
 const REMOTE_CACHE_DIR: &str = "remotes";
 
@@ -104,6 +106,33 @@ pub fn save_theme_preference(preference: &ThemePreference) -> anyhow::Result<()>
 /// exists and parses cleanly. Any failure falls back to `None`, mirroring [`load`].
 pub fn load_theme_preference() -> Option<ThemePreference> {
     load_theme_preference_from(&theme_preference_path()?).ok()
+}
+
+pub fn diff_view_mode_path() -> Option<PathBuf> {
+    Some(application_support_dir()?.join(DIFF_VIEW_MODE_FILE))
+}
+
+pub fn save_diff_view_mode_to(path: &Path, mode: &DiffViewMode) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json = serde_json::to_string_pretty(mode)?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+pub fn load_diff_view_mode_from(path: &Path) -> anyhow::Result<DiffViewMode> {
+    let json = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+pub fn save_diff_view_mode(mode: &DiffViewMode) -> anyhow::Result<()> {
+    let path = diff_view_mode_path().ok_or_else(|| anyhow::anyhow!("$HOME is not set"))?;
+    save_diff_view_mode_to(&path, mode)
+}
+
+pub fn load_diff_view_mode() -> Option<DiffViewMode> {
+    load_diff_view_mode_from(&diff_view_mode_path()?).ok()
 }
 
 /// Where the project list lives for the signed-in user, or `None` if `$HOME` is unset.
@@ -277,6 +306,17 @@ mod tests {
         assert!(path.exists());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_diff_view_mode_round_trips_through_a_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("diff-view-preference.json");
+        save_diff_view_mode_to(&path, &DiffViewMode::Split).expect("save");
+        assert_eq!(
+            load_diff_view_mode_from(&path).expect("load"),
+            DiffViewMode::Split
+        );
     }
 
     fn sample_project_list() -> ProjectList {

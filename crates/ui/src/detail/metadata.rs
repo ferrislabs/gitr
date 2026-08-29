@@ -1,9 +1,8 @@
 //! Renders the commit metadata header (subject, identifier, parents and author) and,
-//! separately, the commit message body — split because the header renders first
-//! above the detail panel's scroll region while [`render_description`] scrolls
-//! together with the header inside the tab's own scroll region, so an unusually
-//! long body cannot squeeze the diff editor beneath it out of the panel. See
-//! `detail::ready_state` for where the two are recombined.
+//! separately, the commit message body — split because [`render_description`] answers
+//! `None` for a commit that has nothing beyond its subject line, which renders no row
+//! rather than an empty one. Both scroll together inside the General tab's single scroll
+//! region; see `detail::general_tab` for where the two are recombined.
 //!
 //! Every value here goes through [`gpui_component::text::markdown`] rather than a plain
 //! `div`, which is what makes the commit's identifier — the thing most worth copying in
@@ -82,7 +81,7 @@ pub(super) fn render_description(commit: &Commit, cx: &App) -> Option<AnyElement
     )
 }
 
-/// Gives the commit body the same code rendering the diff editor uses.
+/// Gives a fenced block in the commit body the app's own code rendering.
 ///
 /// `TextViewStyle::default()` pins `highlight_theme` to the light one whatever the app is
 /// set to, so a fenced block in a commit message rendered light-on-dark until this passed
