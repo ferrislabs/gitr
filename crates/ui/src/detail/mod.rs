@@ -36,8 +36,8 @@
 //! zeroes the diff's scroll offset and clears the window selection. Clearing is the reason
 //! both take a `&mut Window`, which is why [`crate::workspace::Workspace`] threads one into
 //! `sync_panels_from_repository`. It is not optional: `gpui-base` stores a selection
-//! endpoint relative to `bounds.origin` (`text_selection.rs:1336`), so it survives the
-//! content underneath it changing, and a stored `y` then resolves onto whatever row now sits
+//! endpoint relative to the participant's registered origin (`text_selection.rs:1336`), so it
+//! survives the content underneath it changing, and a stored `y` then resolves onto whatever row now sits
 //! at that offset — a highlight over lines the user never dragged across, which Cmd-C would
 //! copy. `TextSelection::clear` is window-wide rather than per-participant, and this panel
 //! has participants beyond the diff body: [`metadata`] renders every value through
@@ -53,15 +53,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Point, Render, ScrollHandle, StatefulInteractiveElement as _,
-    Styled as _, Window, div, prelude::FluentBuilder as _,
+    AnyElement, App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle,
+    StatefulInteractiveElement as _, Styled as _, Window, div, point, prelude::FluentBuilder as _,
+    px,
 };
-use gpui_base::{TextSelection, TextSelectionHandle};
+use gpui_base::{AutoScroll, TextSelection, TextSelectionEvent, TextSelectionHandle};
 use gpui_component::{
     ActiveTheme as _, Sizable as _,
     alert::Alert,
     dock::{Panel, PanelEvent},
+    input::{Copy, SelectAll},
     scroll::ScrollableElement as _,
     spinner::Spinner,
     tab::{Tab, TabBar},
@@ -103,6 +105,8 @@ pub struct DetailPanel {
     detail: LoadState<Arc<CommitDetail>>,
     diff_content: Option<Rc<DiffContent>>,
     diff_selection: TextSelectionHandle,
+    diff_select_all: bool,
+    diff_auto_scroll: AutoScroll,
     diff_view_mode: DiffViewMode,
     selected_tab: DetailTab,
     general_scroll_handle: ScrollHandle,
@@ -114,15 +118,41 @@ impl DetailPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let diff_selection = TextSelectionHandle::new("", cx);
         diff_selection.refresh_window_on_change(window, cx).detach();
+
+        let focus_handle = cx.focus_handle();
+        let focus = focus_handle.clone();
+        diff_selection.focus_with(move |window, cx| focus.focus(window, cx), cx);
+
+        let panel = cx.weak_entity();
+        diff_selection
+            .subscribe(
+                move |event, cx| {
+                    let _ = match event {
+                        TextSelectionEvent::AutoScroll(delta) => {
+                            let delta = *delta;
+                            panel.update(cx, |panel, cx| panel.auto_scroll_diff(delta, cx))
+                        }
+                        TextSelectionEvent::Cleared => {
+                            panel.update(cx, |panel, cx| panel.forget_select_all(cx))
+                        }
+                        TextSelectionEvent::SelectionChanged(_) => Ok(()),
+                    };
+                },
+                cx,
+            )
+            .detach();
+
         Self {
             detail: LoadState::Idle,
             diff_content: None,
             diff_selection,
+            diff_select_all: false,
+            diff_auto_scroll: AutoScroll::default(),
             diff_view_mode: persistence::load_diff_view_mode().unwrap_or_default(),
             selected_tab: DetailTab::default(),
             general_scroll_handle: ScrollHandle::new(),
             diff_scroll_handle: ScrollHandle::new(),
-            focus_handle: cx.focus_handle(),
+            focus_handle,
         }
     }
 
@@ -172,8 +202,53 @@ impl DetailPanel {
     }
 
     fn reset_diff_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.diff_auto_scroll.stop();
+        self.diff_select_all = false;
         self.diff_scroll_handle.set_offset(Point::default());
         TextSelection::clear(window, cx);
+    }
+
+    fn forget_select_all(&mut self, cx: &mut Context<Self>) {
+        if !self.diff_select_all {
+            return;
+        }
+        self.diff_select_all = false;
+        cx.notify();
+    }
+
+    fn auto_scroll_diff(&mut self, delta: Option<Pixels>, cx: &mut Context<Self>) {
+        self.diff_auto_scroll.set(delta, cx, |delta, panel, cx| {
+            let offset = panel.diff_scroll_handle.offset();
+            panel
+                .diff_scroll_handle
+                .set_offset(offset - point(px(0.), delta));
+            cx.notify();
+        });
+    }
+
+    fn on_copy(&mut self, _: &Copy, window: &mut Window, cx: &mut Context<Self>) {
+        let text = TextSelection::selected_text(window, cx);
+        if text.is_empty() {
+            cx.propagate();
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    fn on_select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        let selectable = self.selected_tab == DetailTab::Diff
+            && self
+                .diff_content
+                .as_ref()
+                .is_some_and(|content| !content.is_empty());
+        if !selectable {
+            cx.propagate();
+            return;
+        }
+
+        self.diff_select_all = true;
+        self.diff_selection.set_local_selection(true, cx);
+        cx.notify();
     }
 }
 
@@ -204,6 +279,9 @@ impl Render for DetailPanel {
         let selected_tab = self.selected_tab;
         let diff_view_mode = self.diff_view_mode;
         div()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_copy))
+            .on_action(cx.listener(Self::on_select_all))
             .size_full()
             .flex()
             .flex_col()
@@ -216,6 +294,7 @@ impl Render for DetailPanel {
                     detail,
                     selected_tab,
                     self.diff_content.as_ref(),
+                    self.diff_select_all,
                     &self.diff_selection,
                     &self.general_scroll_handle,
                     &self.diff_scroll_handle,
@@ -310,10 +389,12 @@ fn failed_state(message: &str) -> AnyElement {
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ready_state(
     detail: &CommitDetail,
     selected_tab: DetailTab,
     diff_content: Option<&Rc<DiffContent>>,
+    diff_select_all: bool,
     diff_selection: &TextSelectionHandle,
     general_scroll_handle: &ScrollHandle,
     diff_scroll_handle: &ScrollHandle,
@@ -321,7 +402,13 @@ fn ready_state(
 ) -> AnyElement {
     match selected_tab {
         DetailTab::General => general_tab(detail, general_scroll_handle, cx),
-        DetailTab::Diff => diff_tab(diff_content, diff_selection, diff_scroll_handle, cx),
+        DetailTab::Diff => diff_tab(
+            diff_content,
+            diff_select_all,
+            diff_selection,
+            diff_scroll_handle,
+            cx,
+        ),
     }
 }
 
@@ -352,6 +439,7 @@ fn general_tab(detail: &CommitDetail, scroll_handle: &ScrollHandle, cx: &App) ->
 
 fn diff_tab(
     content: Option<&Rc<DiffContent>>,
+    select_all: bool,
     selection: &TextSelectionHandle,
     scroll_handle: &ScrollHandle,
     cx: &App,
@@ -360,6 +448,12 @@ fn diff_tab(
         .flex_1()
         .min_h_0()
         .min_w_0()
-        .child(diff::render(content, selection, scroll_handle, cx))
+        .child(diff::render(
+            content,
+            select_all,
+            selection,
+            scroll_handle,
+            cx,
+        ))
         .into_any_element()
 }

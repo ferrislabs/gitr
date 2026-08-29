@@ -87,6 +87,7 @@ pub(super) fn cell_strings(rows: &Rows) -> Vec<SharedString> {
 
 pub(super) struct DiffBody {
     content: Rc<DiffContent>,
+    select_all: bool,
     selection: TextSelectionHandle,
     scroll: ScrollHandle,
     theme: ThemeColor,
@@ -98,6 +99,7 @@ pub(super) struct DiffBody {
 
 pub(super) fn body(
     content: Rc<DiffContent>,
+    select_all: bool,
     selection: TextSelectionHandle,
     scroll: ScrollHandle,
     theme: ThemeColor,
@@ -105,6 +107,7 @@ pub(super) fn body(
 ) -> DiffBody {
     DiffBody {
         content,
+        select_all,
         selection,
         scroll,
         theme,
@@ -474,6 +477,15 @@ impl DiffBody {
         self.visible.start * columns..self.visible.end * columns
     }
 
+    fn whole_text(&self) -> String {
+        let ranges: Vec<Option<Range<usize>>> = self
+            .strings()
+            .iter()
+            .map(|text| Some(0..text.len()))
+            .collect();
+        copy_text(self.strings(), &ranges, 0, self.rows().columns())
+    }
+
     fn copy_selection(
         &self,
         bounds: Bounds<Pixels>,
@@ -482,6 +494,9 @@ impl DiffBody {
         window: &Window,
         cx: &App,
     ) -> String {
+        if self.select_all {
+            return self.whole_text();
+        }
         let Some(points) = self
             .selection
             .snapshot(cx)
@@ -721,9 +736,11 @@ impl Element for DiffBody {
             text.prepaint(None, None, *cell_bounds, &mut (), window, cx);
         }
 
+        let viewport = self.scroll.bounds();
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         self.selection.register(
-            TextSelectionRegistration::new(hitbox.clone(), bounds)
+            TextSelectionRegistration::new(hitbox.clone(), viewport)
+                .with_scroll_offset(bounds.origin - viewport.origin)
                 .with_document_order(0)
                 .with_text_bounds(self.cell_bounds.clone()),
             window,
@@ -771,7 +788,12 @@ impl Element for DiffBody {
             for column in 0..columns {
                 let cell_offset = offset * columns + column;
                 let cell_bounds = self.cell_bounds[cell_offset];
-                if let Some(range) = projection.ranges().get(cell_offset).and_then(Clone::clone) {
+                let range = if self.select_all {
+                    Some(0..self.content.strings[first_cell + cell_offset].len())
+                } else {
+                    projection.ranges().get(cell_offset).and_then(Clone::clone)
+                };
+                if let Some(range) = range {
                     paint_selection(
                         self.texts[cell_offset].layout(),
                         range,

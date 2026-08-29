@@ -1613,10 +1613,12 @@ fn theme_preference_menu_item(
 /// The whole native macOS menu bar, rebuilt from scratch on every call — see
 /// [`Workspace::refresh_application_menus`] for when. `Cut`, `Copy`, `Paste` and
 /// `Select All` carry `gpui_component::input`'s own actions and matching [`OsAction`],
-/// not an action this crate defines: the project search box, the "add from URL" field
-/// and the readonly diff editor each register a handler for those every time they
-/// paint, so the menu item reaches whichever one currently has focus exactly as the
-/// keyboard shortcut already does.
+/// not an action this crate defines: the project search box and the "add from URL" field
+/// register a handler for those every time they paint, and `DetailPanel` registers its
+/// own `Copy` and `Select All` for the diff, so the menu item reaches whichever one
+/// currently has focus exactly as the keyboard shortcut already does. The diff needs its
+/// own `Copy` rather than `gpui_component::Root`'s: that one trims the copied string
+/// (`root.rs:552-555`), which eats the indentation of the first selected line.
 fn application_menus(theme_preference: ThemePreference) -> Vec<Menu> {
     vec![
         Menu {

@@ -54,10 +54,14 @@
 //! and a cell's own column offset is what turns it into a range — which is exactly what
 //! `point_in_selection_band` does to two runs that share a `y`, so the arithmetic and the
 //! projection still agree cell for cell. Endpoints survive scrolling because `gpui-base`
-//! stores them relative to `bounds.origin`, which already carries the scroll, so a point off
-//! the top of the viewport
-//! is a negative `y` rather than a lost one. Rows that *are* on screen keep the projection's
-//! own range, so what is highlighted and what is copied cannot drift apart.
+//! stores them relative to `bounds.origin + scroll_offset`, and the participant reports the
+//! two so that their sum is this element's own origin, which already carries the scroll: a
+//! point off the top of the viewport is then a negative `y` rather than a lost one. Rows
+//! that *are* on screen keep the projection's
+//! own range, so what is highlighted and what is copied cannot drift apart. Select All is
+//! the one selection with no window points to derive anything from — it is participant-local
+//! (`set_local_selection`), so `copy_selection` answers the whole document for it directly
+//! and every visible cell is highlighted whole.
 //!
 //! What stays unwindowed is the content width: `body::DiffBody::content_width` shapes every
 //! cell on every layout pass, because the horizontal scroll extent has to consider rows that
@@ -139,6 +143,7 @@ pub(super) fn content(patch: &Patch, mode: DiffViewMode) -> DiffContent {
 
 pub(super) fn render(
     content: Option<&Rc<DiffContent>>,
+    select_all: bool,
     selection: &TextSelectionHandle,
     scroll: &ScrollHandle,
     cx: &App,
@@ -170,6 +175,7 @@ pub(super) fn render(
                 .line_height(px(ROW_HEIGHT))
                 .child(body(
                     Rc::clone(content),
+                    select_all,
                     selection.clone(),
                     scroll.clone(),
                     theme.colors,
