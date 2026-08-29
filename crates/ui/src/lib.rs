@@ -15,6 +15,7 @@ pub mod actions;
 pub mod branch_actions;
 pub mod density;
 pub mod detail;
+pub mod diff_view_mode;
 pub mod graph_palette;
 pub mod history;
 pub mod persistence;
