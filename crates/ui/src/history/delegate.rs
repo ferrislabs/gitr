@@ -27,7 +27,9 @@ use crate::graph_palette::lane_color;
 use crate::repository::model::{History, HistoryFilter, LoadState};
 use crate::workspace::Workspace;
 
-use super::{badges, format, geometry};
+use crate::badges;
+
+use super::{format, geometry};
 
 const SHA_COLUMN: usize = 0;
 const GRAPH_COLUMN: usize = 1;
@@ -39,9 +41,24 @@ const COLUMN_COUNT: usize = 5;
 const BADGE_STRIP_MAX_SHARE: f32 = 0.5;
 
 const SHA_COLUMN_WIDTH: Pixels = px(76.);
-const SUBJECT_COLUMN_WIDTH: Pixels = px(420.);
 const AUTHOR_COLUMN_WIDTH: Pixels = px(150.);
 const DATE_COLUMN_WIDTH: Pixels = px(84.);
+
+/// What Subject falls back to before the table has been measured — the width it had when
+/// every column was fixed. One frame, at most: [`HistoryTableDelegate::set_available_width`]
+/// replaces it as soon as the panel reports its own bounds.
+const SUBJECT_FALLBACK_WIDTH: Pixels = px(420.);
+
+/// Subject never shrinks below this, whatever the window does. Past it the table scrolls
+/// horizontally instead, which is the lesser evil: a subject column narrower than this
+/// shows a badge and nothing else.
+const SUBJECT_MIN_WIDTH: Pixels = px(240.);
+
+/// The inert filler `TableDelegate::render_last_empty_col` appends after the final column
+/// — `h_flex().w_3()`, so twelve pixels. Counted here because it sits inside the same row
+/// flex as the columns: ignoring it would make Subject twelve pixels too wide and put the
+/// table permanently one nudge into horizontal scroll.
+const LAST_EMPTY_COL_WIDTH: Pixels = px(12.);
 
 /// The fill GitX gives the checked-out commit's node, taken from `PBGitRevisionCell`.
 ///
@@ -60,6 +77,7 @@ pub(crate) struct HistoryTableDelegate {
     deletion: Deletion,
     head_commit: Option<ObjectId>,
     workspace: Option<WeakEntity<Workspace>>,
+    available_width: Option<Pixels>,
 }
 
 impl HistoryTableDelegate {
@@ -72,7 +90,42 @@ impl HistoryTableDelegate {
             deletion: Deletion::default(),
             head_commit: None,
             workspace: None,
+            available_width: None,
         }
+    }
+
+    /// Reports how wide the table itself is, so Subject can take whatever the four fixed
+    /// columns leave.
+    ///
+    /// `gpui_component`'s `Column` has no flex or grow: every width is a number of pixels,
+    /// resolved once per `TableState::refresh`. Left at a constant, Subject stopped short
+    /// of the right edge on any window wider than the sum of the five, and the leftover
+    /// showed as dead space past Date while a branch badge was being cropped two columns
+    /// to its left. The panel measures its own bounds and hands them here instead.
+    ///
+    /// Answers whether anything changed: a caller that refreshes unconditionally would
+    /// refresh on every prepaint, and a refresh notifies, which prepaints.
+    pub(crate) fn set_available_width(&mut self, width: Pixels) -> bool {
+        if self.available_width == Some(width) {
+            return false;
+        }
+        self.available_width = Some(width);
+        true
+    }
+
+    /// The width Subject renders at: everything the other four columns do not take.
+    fn subject_width(&self) -> Pixels {
+        let Some(available) = self.available_width else {
+            return SUBJECT_FALLBACK_WIDTH;
+        };
+
+        let taken = SHA_COLUMN_WIDTH
+            + self.graph_width
+            + AUTHOR_COLUMN_WIDTH
+            + DATE_COLUMN_WIDTH
+            + LAST_EMPTY_COL_WIDTH;
+
+        (available - taken).max(SUBJECT_MIN_WIDTH)
     }
 
     pub(crate) fn set_head(&mut self, deletion: Deletion, commit: Option<ObjectId>) {
@@ -148,7 +201,9 @@ impl TableDelegate for HistoryTableDelegate {
                 .resizable(false)
                 .movable(false)
                 .selectable(false),
-            SUBJECT_COLUMN => Column::new("subject", "Subject").width(SUBJECT_COLUMN_WIDTH),
+            SUBJECT_COLUMN => Column::new("subject", "Subject")
+                .width(self.subject_width())
+                .min_width(SUBJECT_MIN_WIDTH),
             AUTHOR_COLUMN => Column::new("author", "Author").width(AUTHOR_COLUMN_WIDTH),
             DATE_COLUMN => Column::new("date", "Date")
                 .width(DATE_COLUMN_WIDTH)
@@ -598,6 +653,50 @@ mod tests {
         delegate.set_history(LoadState::Ready(Arc::new(fixture_history())));
 
         assert_eq!(delegate.graph_width, geometry::LANE_SPACING * 2usize);
+    }
+
+    #[test]
+    fn subject_takes_whatever_the_fixed_columns_leave() {
+        let mut delegate = HistoryTableDelegate::new();
+        delegate.set_history(LoadState::Ready(Arc::new(fixture_history())));
+        assert!(delegate.set_available_width(px(1200.)));
+
+        let fixed = SHA_COLUMN_WIDTH
+            + delegate.graph_width
+            + AUTHOR_COLUMN_WIDTH
+            + DATE_COLUMN_WIDTH
+            + LAST_EMPTY_COL_WIDTH;
+        assert_eq!(
+            delegate.subject_width() + fixed,
+            px(1200.),
+            "the five columns and the trailing filler must add up to the table's own \
+             width, or Author and Date stop short of the right edge and the leftover \
+             shows as dead space"
+        );
+    }
+
+    #[test]
+    fn subject_stops_shrinking_at_its_minimum() {
+        let mut delegate = HistoryTableDelegate::new();
+        delegate.set_available_width(px(300.));
+        assert_eq!(delegate.subject_width(), SUBJECT_MIN_WIDTH);
+    }
+
+    #[test]
+    fn an_unmeasured_table_falls_back_rather_than_collapsing_subject() {
+        let delegate = HistoryTableDelegate::new();
+        assert_eq!(delegate.subject_width(), SUBJECT_FALLBACK_WIDTH);
+    }
+
+    #[test]
+    fn the_same_width_twice_reports_no_change() {
+        let mut delegate = HistoryTableDelegate::new();
+        assert!(delegate.set_available_width(px(900.)));
+        assert!(
+            !delegate.set_available_width(px(900.)),
+            "a width that did not move must not ask for a refresh: the refresh notifies, \
+             the notify prepaints, and the prepaint is what reports the width"
+        );
     }
 
     #[test]

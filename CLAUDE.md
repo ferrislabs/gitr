@@ -126,6 +126,14 @@ issue #2754). On a large history that is an out-of-memory crash.
 
 **`TableDelegate::visible_rows_changed` runs every scroll frame.** Keep it allocation-free.
 
+**A `gpui_component` `Column` has no flex and no grow** — every width is a number of
+pixels, resolved once per `TableState::refresh`. A column that has to fill the window
+therefore needs the panel to measure *itself* (`ElementExt::on_prepaint` on the container
+around the `DataTable`) and hand that width to the delegate, which subtracts the fixed
+columns and the twelve pixels of `render_last_empty_col`. Two things make it a loop rather
+than a measurement if got wrong: a refresh notifies and a notify prepaints, so the delegate
+must answer whether the width actually moved and the panel must refresh only when it did.
+
 **History is walked in date order, matching GitX.** `gix_traverse::commit::topo::Builder`
 with `Sorting::DateOrder` reproduces `git rev-list --date-order` exactly — verified by
 diffing the two sequences over this repository. That builder is the way in either case: it

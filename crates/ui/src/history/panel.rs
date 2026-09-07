@@ -10,10 +10,10 @@ use std::sync::Arc;
 use domain::{HistoryScope, ObjectId, Reference};
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement as _, Render, Styled as _, Subscription, WeakEntity, Window, div, px,
+    ParentElement as _, Pixels, Render, Styled as _, Subscription, WeakEntity, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _,
+    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _,
     dock::{Panel, PanelEvent},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -127,6 +127,25 @@ impl HistoryPanel {
             table.refresh(cx);
         });
         cx.notify();
+    }
+
+    /// Hands the table's own width to its delegate, so Subject can take the space the
+    /// four fixed columns leave rather than stopping at a constant.
+    ///
+    /// Fed from `on_prepaint`, which runs on every frame: the delegate answers whether the
+    /// width actually moved and nothing happens when it did not. Refreshing unconditionally
+    /// here would notify on every prepaint, and a notify is what schedules the next one.
+    fn set_available_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        let changed = self.table.update(cx, |table, cx| {
+            let changed = table.delegate_mut().set_available_width(width);
+            if changed {
+                table.refresh(cx);
+            }
+            changed
+        });
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Drops everything that belonged to the repository previously shown, including the
@@ -288,12 +307,23 @@ impl Render for HistoryPanel {
                     ),
             )
             .child(
-                div().flex_1().min_h_0().child(
-                    DataTable::new(&self.table)
-                        .stripe(true)
-                        .bordered(false)
-                        .with_size(density::TABLE_ROW_HEIGHT),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .on_prepaint({
+                        let panel = cx.entity();
+                        move |bounds, _, cx| {
+                            panel.update(cx, |panel, cx| {
+                                panel.set_available_width(bounds.size.width, cx)
+                            })
+                        }
+                    })
+                    .child(
+                        DataTable::new(&self.table)
+                            .stripe(true)
+                            .bordered(false)
+                            .with_size(density::TABLE_ROW_HEIGHT),
+                    ),
             )
     }
 }
