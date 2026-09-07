@@ -76,11 +76,25 @@ use gpui_component::{
     tab::{Tab, TabBar},
 };
 
+use domain::{BranchName, Reference};
+
 use crate::diff_view_mode::DiffViewMode;
 use crate::persistence;
 use crate::repository::{CommitDetail, LoadState};
 
 use diff::{Collapsed, DiffContent, ToggleFile};
+
+/// The branches a commit is named by in the header, and which of them is checked out.
+///
+/// Handed in by [`crate::workspace::Workspace`] rather than derived here: the references
+/// live on the loaded `History`, and this panel is given what it renders, never a
+/// repository to read. `head_branch` travels with them because a badge's colour depends on
+/// it — the checked-out branch is the one badge that is not green.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitOwnership {
+    pub references: Vec<Reference>,
+    pub head_branch: Option<BranchName>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DetailTab {
@@ -117,6 +131,7 @@ pub struct DetailPanel {
     diff_auto_scroll: AutoScroll,
     diff_view_mode: DiffViewMode,
     selected_tab: DetailTab,
+    ownership: CommitOwnership,
     general_scroll_handle: ScrollHandle,
     diff_scroll_handle: ScrollHandle,
     focus_handle: FocusHandle,
@@ -159,6 +174,7 @@ impl DetailPanel {
             diff_auto_scroll: AutoScroll::default(),
             diff_view_mode: persistence::load_diff_view_mode().unwrap_or_default(),
             selected_tab: DetailTab::default(),
+            ownership: CommitOwnership::default(),
             general_scroll_handle: ScrollHandle::new(),
             diff_scroll_handle: ScrollHandle::new(),
             focus_handle,
@@ -175,6 +191,17 @@ impl DetailPanel {
         self.diff_collapsed.clear();
         self.rebuild_diff_content();
         self.reset_diff_view(window, cx);
+        cx.notify();
+    }
+
+    /// The branches the shown commit is named by. Set separately from
+    /// [`Self::set_detail`]: the detail is one commit's own content and never changes,
+    /// while the branches move under it whenever a reference does.
+    pub fn set_ownership(&mut self, ownership: CommitOwnership, cx: &mut Context<Self>) {
+        if self.ownership == ownership {
+            return;
+        }
+        self.ownership = ownership;
         cx.notify();
     }
 
@@ -333,6 +360,7 @@ impl Render for DetailPanel {
                 LoadState::Failed(message) => failed_state(message),
                 LoadState::Ready(detail) => ready_state(
                     detail,
+                    &self.ownership,
                     selected_tab,
                     self.diff_content.as_ref(),
                     self.diff_select_all,
@@ -434,6 +462,7 @@ fn failed_state(message: &str) -> AnyElement {
 #[allow(clippy::too_many_arguments)]
 fn ready_state(
     detail: &CommitDetail,
+    ownership: &CommitOwnership,
     selected_tab: DetailTab,
     diff_content: Option<&Rc<DiffContent>>,
     diff_select_all: bool,
@@ -444,7 +473,7 @@ fn ready_state(
     cx: &App,
 ) -> AnyElement {
     match selected_tab {
-        DetailTab::General => general_tab(detail, general_scroll_handle, cx),
+        DetailTab::General => general_tab(detail, ownership, general_scroll_handle, cx),
         DetailTab::Diff => diff_tab(
             diff_content,
             diff_select_all,
@@ -460,7 +489,12 @@ fn ready_state(
 /// and giving the body a short scroller of its own. A bounded inner scroller inside an
 /// already-tall panel wastes the height it was given and cuts a long message mid-sentence
 /// while empty space sits below it.
-fn general_tab(detail: &CommitDetail, scroll_handle: &ScrollHandle, cx: &App) -> AnyElement {
+fn general_tab(
+    detail: &CommitDetail,
+    ownership: &CommitOwnership,
+    scroll_handle: &ScrollHandle,
+    cx: &App,
+) -> AnyElement {
     div()
         .relative()
         .flex_1()
@@ -474,7 +508,7 @@ fn general_tab(detail: &CommitDetail, scroll_handle: &ScrollHandle, cx: &App) ->
                 .track_scroll(scroll_handle)
                 .flex()
                 .flex_col()
-                .child(metadata::render_header(&detail.commit, cx))
+                .child(metadata::render_header(&detail.commit, ownership, cx))
                 .children(metadata::render_description(&detail.commit, cx)),
         )
         .vertical_scrollbar(scroll_handle)

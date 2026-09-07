@@ -10,15 +10,16 @@ use std::sync::Arc;
 
 use domain::{BranchName, CommitSummary, ObjectId, Reference};
 use gpui::{
-    AnyElement, App, Bounds, Context, Div, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathBuilder, Pixels, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, fill, point,
-    prelude::FluentBuilder as _, px, relative, size,
+    AnyElement, App, Bounds, Context, Div, ElementId, InteractiveElement as _, IntoElement,
+    ParentElement as _, PathBuilder, Pixels, SharedString, Stateful, Styled as _, WeakEntity,
+    Window, canvas, div, fill, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{
     ActiveTheme as _, ThemeColor, h_flex,
     menu::ContextMenuExt as _,
+    popover::Popover,
     table::{Column, TableDelegate, TableState},
+    v_flex,
 };
 use graph::GraphRow;
 
@@ -27,7 +28,9 @@ use crate::graph_palette::lane_color;
 use crate::repository::model::{History, HistoryFilter, LoadState};
 use crate::workspace::Workspace;
 
-use super::{badges, format, geometry};
+use crate::badges;
+
+use super::{format, geometry};
 
 const SHA_COLUMN: usize = 0;
 const GRAPH_COLUMN: usize = 1;
@@ -36,12 +39,35 @@ const AUTHOR_COLUMN: usize = 3;
 const DATE_COLUMN: usize = 4;
 const COLUMN_COUNT: usize = 5;
 
+/// The share of the subject cell the badges may take before the rest is counted into a
+/// `+N`.
 const BADGE_STRIP_MAX_SHARE: f32 = 0.5;
 
+/// `gap_1` between badges, and `px_2` on each side of the subject cell — the two the strip
+/// has to budget around. Both are what the cell actually renders; a mismatch here shows up
+/// as a badge cropped by exactly the difference.
+const BADGE_GAP: Pixels = px(4.);
+const SUBJECT_CELL_PADDING: Pixels = px(8.);
+
 const SHA_COLUMN_WIDTH: Pixels = px(76.);
-const SUBJECT_COLUMN_WIDTH: Pixels = px(420.);
 const AUTHOR_COLUMN_WIDTH: Pixels = px(150.);
 const DATE_COLUMN_WIDTH: Pixels = px(84.);
+
+/// What Subject falls back to before the table has been measured — the width it had when
+/// every column was fixed. One frame, at most: [`HistoryTableDelegate::set_available_width`]
+/// replaces it as soon as the panel reports its own bounds.
+const SUBJECT_FALLBACK_WIDTH: Pixels = px(420.);
+
+/// Subject never shrinks below this, whatever the window does. Past it the table scrolls
+/// horizontally instead, which is the lesser evil: a subject column narrower than this
+/// shows a badge and nothing else.
+const SUBJECT_MIN_WIDTH: Pixels = px(240.);
+
+/// The inert filler `TableDelegate::render_last_empty_col` appends after the final column
+/// — `h_flex().w_3()`, so twelve pixels. Counted here because it sits inside the same row
+/// flex as the columns: ignoring it would make Subject twelve pixels too wide and put the
+/// table permanently one nudge into horizontal scroll.
+const LAST_EMPTY_COL_WIDTH: Pixels = px(12.);
 
 /// The fill GitX gives the checked-out commit's node, taken from `PBGitRevisionCell`.
 ///
@@ -60,6 +86,7 @@ pub(crate) struct HistoryTableDelegate {
     deletion: Deletion,
     head_commit: Option<ObjectId>,
     workspace: Option<WeakEntity<Workspace>>,
+    available_width: Option<Pixels>,
 }
 
 impl HistoryTableDelegate {
@@ -72,7 +99,48 @@ impl HistoryTableDelegate {
             deletion: Deletion::default(),
             head_commit: None,
             workspace: None,
+            available_width: None,
         }
+    }
+
+    /// Reports how wide the table itself is, so Subject can take whatever the four fixed
+    /// columns leave.
+    ///
+    /// `gpui_component`'s `Column` has no flex or grow: every width is a number of pixels,
+    /// resolved once per `TableState::refresh`. Left at a constant, Subject stopped short
+    /// of the right edge on any window wider than the sum of the five, and the leftover
+    /// showed as dead space past Date while a branch badge was being cropped two columns
+    /// to its left. The panel measures its own bounds and hands them here instead.
+    ///
+    /// Answers whether anything changed: a caller that refreshes unconditionally would
+    /// refresh on every prepaint, and a refresh notifies, which prepaints.
+    pub(crate) fn set_available_width(&mut self, width: Pixels) -> bool {
+        if self.available_width == Some(width) {
+            return false;
+        }
+        self.available_width = Some(width);
+        true
+    }
+
+    /// How much of the subject cell the badge strip may fill before the rest becomes a
+    /// `+N`.
+    fn badge_budget(&self) -> Pixels {
+        (self.subject_width() - SUBJECT_CELL_PADDING * 2.) * BADGE_STRIP_MAX_SHARE
+    }
+
+    /// The width Subject renders at: everything the other four columns do not take.
+    fn subject_width(&self) -> Pixels {
+        let Some(available) = self.available_width else {
+            return SUBJECT_FALLBACK_WIDTH;
+        };
+
+        let taken = SHA_COLUMN_WIDTH
+            + self.graph_width
+            + AUTHOR_COLUMN_WIDTH
+            + DATE_COLUMN_WIDTH
+            + LAST_EMPTY_COL_WIDTH;
+
+        (available - taken).max(SUBJECT_MIN_WIDTH)
     }
 
     pub(crate) fn set_head(&mut self, deletion: Deletion, commit: Option<ObjectId>) {
@@ -148,7 +216,9 @@ impl TableDelegate for HistoryTableDelegate {
                 .resizable(false)
                 .movable(false)
                 .selectable(false),
-            SUBJECT_COLUMN => Column::new("subject", "Subject").width(SUBJECT_COLUMN_WIDTH),
+            SUBJECT_COLUMN => Column::new("subject", "Subject")
+                .width(self.subject_width())
+                .min_width(SUBJECT_MIN_WIDTH),
             AUTHOR_COLUMN => Column::new("author", "Author").width(AUTHOR_COLUMN_WIDTH),
             DATE_COLUMN => Column::new("date", "Date")
                 .width(DATE_COLUMN_WIDTH)
@@ -203,7 +273,7 @@ impl TableDelegate for HistoryTableDelegate {
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let theme = cx.theme().colors;
@@ -229,6 +299,8 @@ impl TableDelegate for HistoryTableDelegate {
                 history.references_at(commit.id),
                 &self.deletion,
                 self.workspace.as_ref(),
+                self.badge_budget(),
+                window,
                 &theme,
             ),
             AUTHOR_COLUMN => author_cell(commit),
@@ -323,11 +395,14 @@ fn graph_cell(row: GraphRow, is_head: bool, theme: &ThemeColor) -> AnyElement {
     .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn subject_cell(
     commit: &CommitSummary,
     references: &[Reference],
     deletion: &Deletion,
     workspace: Option<&WeakEntity<Workspace>>,
+    budget: Pixels,
+    window: &Window,
     theme: &ThemeColor,
 ) -> AnyElement {
     h_flex()
@@ -338,46 +413,149 @@ fn subject_cell(
         .overflow_hidden()
         .when(!references.is_empty(), |cell| {
             cell.child(badge_strip(
-                commit.id, references, deletion, workspace, theme,
+                commit.id, references, deletion, workspace, budget, window, theme,
             ))
         })
         .child(div().truncate().child(commit.summary.clone()))
         .into_any_element()
 }
 
+/// The badges before a subject, and a `+N` for whatever did not fit.
+///
+/// A badge renders whole or not at all. The strip used to be a scroller clipped at half
+/// the cell, which put a branch name cut mid-word in front of the reader and asked them to
+/// discover that the fragment could be dragged. Counting the remainder instead says the
+/// same thing in one glyph and never lies about a name.
+///
+/// The count is measured against `budget` rather than left to the layout: gpui gives an
+/// element its bounds one phase *after* the children are built, so the choice of what to
+/// build cannot read them. The subject column's width is known here — the delegate
+/// computed it — so the strip predicts `Tag`'s own metrics through
+/// [`badges::measure_badge`] instead.
+#[allow(clippy::too_many_arguments)]
 fn badge_strip(
     commit: ObjectId,
     references: &[Reference],
     deletion: &Deletion,
     workspace: Option<&WeakEntity<Workspace>>,
+    budget: Pixels,
+    window: &Window,
     theme: &ThemeColor,
 ) -> AnyElement {
     let head_branch = deletion.head.as_ref();
+
+    let widths: Vec<Pixels> = references
+        .iter()
+        .map(|reference| badges::measure_badge(&reference.short_name(), window))
+        .collect();
+    let overflow = badges::measure_badge(&badges::overflow_label(references.len()), window);
+    let shown = badges::fitting_badge_count(&widths, budget, BADGE_GAP, overflow);
+    let hidden = references.len() - shown;
+
     let id = SharedString::from(format!("badges-{}", commit.to_hex_prefix(40)));
 
-    div()
+    h_flex()
         .id(id)
-        .max_w(relative(BADGE_STRIP_MAX_SHARE))
-        .overflow_x_scroll()
-        .restrict_scroll_to_axis()
-        .child(
-            h_flex()
-                .gap_1()
-                .flex_none()
-                .children(references.iter().enumerate().map(|(index, reference)| {
-                    let badge = badges::render_badge(reference, head_branch, theme);
-                    let cell = div().id(("branch-badge", index)).flex_none().child(badge);
-                    match deletable_branch(reference, deletion, workspace) {
-                        Some((branch, switch_to, workspace)) => cell
-                            .context_menu(move |menu, _, _| {
-                                branch_menu(menu, &branch, switch_to.as_ref(), &workspace)
-                            })
-                            .into_any_element(),
-                        None => cell.into_any_element(),
-                    }
-                })),
+        .gap_1()
+        .flex_none()
+        .children(
+            references
+                .iter()
+                .take(shown)
+                .enumerate()
+                .map(|(index, reference)| {
+                    badge_cell(
+                        ("branch-badge", index),
+                        reference,
+                        head_branch,
+                        deletion,
+                        workspace,
+                        theme,
+                    )
+                }),
         )
+        .when(hidden > 0, |strip| {
+            strip.child(overflow_popover(
+                commit,
+                &references[shown..],
+                deletion,
+                workspace,
+                theme,
+            ))
+        })
         .into_any_element()
+}
+
+/// One badge, carrying the branch menu when the reference is a local branch this
+/// repository could delete.
+///
+/// Shared by the strip and by the popover behind the counter, so a hidden branch is right
+/// -clickable exactly like a visible one — the counter changes how many names are on
+/// screen, never what can be done with them.
+fn badge_cell(
+    id: impl Into<ElementId>,
+    reference: &Reference,
+    head_branch: Option<&BranchName>,
+    deletion: &Deletion,
+    workspace: Option<&WeakEntity<Workspace>>,
+    theme: &ThemeColor,
+) -> AnyElement {
+    let badge = badges::render_badge(reference, head_branch, theme);
+    let cell = div().id(id).flex_none().child(badge);
+
+    match deletable_branch(reference, deletion, workspace) {
+        Some((branch, switch_to, workspace)) => cell
+            .context_menu(move |menu, _, _| {
+                branch_menu(menu, &branch, switch_to.as_ref(), &workspace)
+            })
+            .into_any_element(),
+        None => cell.into_any_element(),
+    }
+}
+
+/// The `+N` counter, and the badges it stands for behind a click.
+///
+/// A popover rather than a tooltip. A tooltip dismisses the moment the pointer leaves the
+/// trigger, so the names under it could be read and never reached — and a branch reachable
+/// only until you move towards it is worse than one plainly absent. Clicking pins the list
+/// open, and every badge in it carries the same context menu as the ones on the row.
+fn overflow_popover(
+    commit: ObjectId,
+    hidden: &[Reference],
+    deletion: &Deletion,
+    workspace: Option<&WeakEntity<Workspace>>,
+    theme: &ThemeColor,
+) -> AnyElement {
+    let count = hidden.len();
+    let hidden: Vec<Reference> = hidden.to_vec();
+    let deletion = deletion.clone();
+    let workspace = workspace.cloned();
+    let theme = *theme;
+
+    Popover::new(ElementId::Name(
+        format!("badge-overflow-{}", commit.to_hex_prefix(40)).into(),
+    ))
+    .trigger(badges::OverflowBadge::new(count, &theme))
+    .content(move |_, _, _| {
+        let head_branch = deletion.head.as_ref();
+        v_flex().gap_1().items_start().children(
+            hidden
+                .iter()
+                .enumerate()
+                .map(|(index, reference)| {
+                    badge_cell(
+                        ("hidden-branch-badge", index),
+                        reference,
+                        head_branch,
+                        &deletion,
+                        workspace.as_ref(),
+                        &theme,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    })
+    .into_any_element()
 }
 
 type DeletableBranch = (BranchName, Option<BranchName>, WeakEntity<Workspace>);
@@ -598,6 +776,50 @@ mod tests {
         delegate.set_history(LoadState::Ready(Arc::new(fixture_history())));
 
         assert_eq!(delegate.graph_width, geometry::LANE_SPACING * 2usize);
+    }
+
+    #[test]
+    fn subject_takes_whatever_the_fixed_columns_leave() {
+        let mut delegate = HistoryTableDelegate::new();
+        delegate.set_history(LoadState::Ready(Arc::new(fixture_history())));
+        assert!(delegate.set_available_width(px(1200.)));
+
+        let fixed = SHA_COLUMN_WIDTH
+            + delegate.graph_width
+            + AUTHOR_COLUMN_WIDTH
+            + DATE_COLUMN_WIDTH
+            + LAST_EMPTY_COL_WIDTH;
+        assert_eq!(
+            delegate.subject_width() + fixed,
+            px(1200.),
+            "the five columns and the trailing filler must add up to the table's own \
+             width, or Author and Date stop short of the right edge and the leftover \
+             shows as dead space"
+        );
+    }
+
+    #[test]
+    fn subject_stops_shrinking_at_its_minimum() {
+        let mut delegate = HistoryTableDelegate::new();
+        delegate.set_available_width(px(300.));
+        assert_eq!(delegate.subject_width(), SUBJECT_MIN_WIDTH);
+    }
+
+    #[test]
+    fn an_unmeasured_table_falls_back_rather_than_collapsing_subject() {
+        let delegate = HistoryTableDelegate::new();
+        assert_eq!(delegate.subject_width(), SUBJECT_FALLBACK_WIDTH);
+    }
+
+    #[test]
+    fn the_same_width_twice_reports_no_change() {
+        let mut delegate = HistoryTableDelegate::new();
+        assert!(delegate.set_available_width(px(900.)));
+        assert!(
+            !delegate.set_available_width(px(900.)),
+            "a width that did not move must not ask for a refresh: the refresh notifies, \
+             the notify prepaints, and the prepaint is what reports the width"
+        );
     }
 
     #[test]

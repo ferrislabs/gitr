@@ -1,5 +1,5 @@
-//! Renders the commit metadata header (subject, identifier, parents and author) and,
-//! separately, the commit message body — split because [`render_description`] answers
+//! Renders the commit metadata header (the branches the commit belongs to, then subject,
+//! identifier, parents, author and date) and, separately, the commit message body — split because [`render_description`] answers
 //! `None` for a commit that has nothing beyond its subject line, which renders no row
 //! rather than an empty one. Both scroll together inside the General tab's single scroll
 //! region; see `detail::general_tab` for where the two are recombined.
@@ -15,12 +15,19 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme as _, text, text::TextViewStyle};
 
+use crate::badges;
+
+use super::CommitOwnership;
 use super::format::{abbreviate, escape_markdown, format_timestamp};
 
 const LABEL_WIDTH: f32 = 84.;
 const BADGE_RADIUS: f32 = 4.;
 
-pub(super) fn render_header(commit: &Commit, cx: &App) -> impl IntoElement {
+pub(super) fn render_header(
+    commit: &Commit,
+    ownership: &CommitOwnership,
+    cx: &App,
+) -> impl IntoElement {
     let mono = cx.theme().mono_font_family.clone();
 
     let mut rows = vec![
@@ -49,8 +56,55 @@ pub(super) fn render_header(commit: &Commit, cx: &App) -> impl IntoElement {
         selectable("author", &author_line(commit), cx),
         cx,
     ));
+    rows.push(row(
+        "Date",
+        selectable("date", &format_timestamp(commit.author.time), cx),
+        cx,
+    ));
 
-    div().flex().flex_col().gap_1().p_3().children(rows)
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_3()
+        .children(reference_strip(ownership, cx))
+        .children(rows)
+}
+
+/// The branches the commit belongs to, above everything else in the header.
+///
+/// Same badges, same colours as the history table's — a branch has to read as one thing
+/// across the window, so both go through [`crate::badges`] rather than each styling a
+/// reference of its own. What differs is the set: the table draws the references that
+/// *point at* a commit and leaves every other row bare, while here a commit that is not a
+/// tip is still named by the branch it was written on
+/// (`History::owning_references`).
+///
+/// Wraps rather than scrolls. The strip in the table is one line inside a row of fixed
+/// height and has nowhere to grow, but this header is free to take a second line, and a
+/// branch name cut in half is the thing the whole change is about.
+fn reference_strip(ownership: &CommitOwnership, cx: &App) -> Option<AnyElement> {
+    if ownership.references.is_empty() {
+        return None;
+    }
+
+    let theme = cx.theme().colors;
+    let head = ownership.head_branch.as_ref();
+
+    Some(
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .pb_1()
+            .children(
+                ownership
+                    .references
+                    .iter()
+                    .map(|reference| badges::render_badge(reference, head, &theme)),
+            )
+            .into_any_element(),
+    )
 }
 
 /// The commit message body, if it has one beyond the subject line — `None` renders
@@ -132,14 +186,14 @@ fn row(label: &'static str, value: impl IntoElement, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// Name and address only — the timestamp has a row of its own.
+///
+/// The two shared a row until the header widened: a long address and a full date ran past
+/// the panel and wrapped mid-value, which put the date on a second line without a label
+/// beside it.
 fn author_line(commit: &Commit) -> String {
     let signature = &commit.author;
-    format!(
-        "{} <{}>    {}",
-        signature.name,
-        signature.email,
-        format_timestamp(signature.time)
-    )
+    format!("{} <{}>", signature.name, signature.email)
 }
 
 fn parent_badges(parents: &Parents, mono: SharedString, cx: &App) -> Option<AnyElement> {

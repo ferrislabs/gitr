@@ -5,7 +5,6 @@
 //! [`crate::repository::model::LoadState`] it is handed and never reads a repository —
 //! see the module docs on [`panel`] for the exact contract.
 
-mod badges;
 mod delegate;
 mod format;
 mod geometry;
