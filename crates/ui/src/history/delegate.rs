@@ -10,16 +10,16 @@ use std::sync::Arc;
 
 use domain::{BranchName, CommitSummary, ObjectId, Reference};
 use gpui::{
-    AnyElement, App, Bounds, Context, Div, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathBuilder, Pixels, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, fill, point,
-    prelude::FluentBuilder as _, px, size,
+    AnyElement, App, Bounds, Context, Div, ElementId, InteractiveElement as _, IntoElement,
+    ParentElement as _, PathBuilder, Pixels, SharedString, Stateful, Styled as _, WeakEntity,
+    Window, canvas, div, fill, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{
     ActiveTheme as _, ThemeColor, h_flex,
     menu::ContextMenuExt as _,
+    popover::Popover,
     table::{Column, TableDelegate, TableState},
-    tooltip::Tooltip,
+    v_flex,
 };
 use graph::GraphRow;
 
@@ -452,17 +452,6 @@ fn badge_strip(
     let shown = badges::fitting_badge_count(&widths, budget, BADGE_GAP, overflow);
     let hidden = references.len() - shown;
 
-    // What the counter stands for, so the names it hides stay reachable rather than
-    // merely gone.
-    let hidden_names = SharedString::from(
-        references
-            .iter()
-            .skip(shown)
-            .map(Reference::short_name)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-
     let id = SharedString::from(format!("badges-{}", commit.to_hex_prefix(40)));
 
     h_flex()
@@ -475,28 +464,98 @@ fn badge_strip(
                 .take(shown)
                 .enumerate()
                 .map(|(index, reference)| {
-                    let badge = badges::render_badge(reference, head_branch, theme);
-                    let cell = div().id(("branch-badge", index)).flex_none().child(badge);
-                    match deletable_branch(reference, deletion, workspace) {
-                        Some((branch, switch_to, workspace)) => cell
-                            .context_menu(move |menu, _, _| {
-                                branch_menu(menu, &branch, switch_to.as_ref(), &workspace)
-                            })
-                            .into_any_element(),
-                        None => cell.into_any_element(),
-                    }
+                    badge_cell(
+                        ("branch-badge", index),
+                        reference,
+                        head_branch,
+                        deletion,
+                        workspace,
+                        theme,
+                    )
                 }),
         )
         .when(hidden > 0, |strip| {
-            strip.child(
-                div()
-                    .id("branch-badge-overflow")
-                    .flex_none()
-                    .tooltip(move |window, cx| Tooltip::new(hidden_names.clone()).build(window, cx))
-                    .child(badges::render_overflow_badge(hidden, theme)),
-            )
+            strip.child(overflow_popover(
+                commit,
+                &references[shown..],
+                deletion,
+                workspace,
+                theme,
+            ))
         })
         .into_any_element()
+}
+
+/// One badge, carrying the branch menu when the reference is a local branch this
+/// repository could delete.
+///
+/// Shared by the strip and by the popover behind the counter, so a hidden branch is right
+/// -clickable exactly like a visible one — the counter changes how many names are on
+/// screen, never what can be done with them.
+fn badge_cell(
+    id: impl Into<ElementId>,
+    reference: &Reference,
+    head_branch: Option<&BranchName>,
+    deletion: &Deletion,
+    workspace: Option<&WeakEntity<Workspace>>,
+    theme: &ThemeColor,
+) -> AnyElement {
+    let badge = badges::render_badge(reference, head_branch, theme);
+    let cell = div().id(id).flex_none().child(badge);
+
+    match deletable_branch(reference, deletion, workspace) {
+        Some((branch, switch_to, workspace)) => cell
+            .context_menu(move |menu, _, _| {
+                branch_menu(menu, &branch, switch_to.as_ref(), &workspace)
+            })
+            .into_any_element(),
+        None => cell.into_any_element(),
+    }
+}
+
+/// The `+N` counter, and the badges it stands for behind a click.
+///
+/// A popover rather than a tooltip. A tooltip dismisses the moment the pointer leaves the
+/// trigger, so the names under it could be read and never reached — and a branch reachable
+/// only until you move towards it is worse than one plainly absent. Clicking pins the list
+/// open, and every badge in it carries the same context menu as the ones on the row.
+fn overflow_popover(
+    commit: ObjectId,
+    hidden: &[Reference],
+    deletion: &Deletion,
+    workspace: Option<&WeakEntity<Workspace>>,
+    theme: &ThemeColor,
+) -> AnyElement {
+    let count = hidden.len();
+    let hidden: Vec<Reference> = hidden.to_vec();
+    let deletion = deletion.clone();
+    let workspace = workspace.cloned();
+    let theme = *theme;
+
+    Popover::new(ElementId::Name(
+        format!("badge-overflow-{}", commit.to_hex_prefix(40)).into(),
+    ))
+    .trigger(badges::OverflowBadge::new(count, &theme))
+    .content(move |_, _, _| {
+        let head_branch = deletion.head.as_ref();
+        v_flex().gap_1().items_start().children(
+            hidden
+                .iter()
+                .enumerate()
+                .map(|(index, reference)| {
+                    badge_cell(
+                        ("hidden-branch-badge", index),
+                        reference,
+                        head_branch,
+                        &deletion,
+                        workspace.as_ref(),
+                        &theme,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    })
+    .into_any_element()
 }
 
 type DeletableBranch = (BranchName, Option<BranchName>, WeakEntity<Workspace>);

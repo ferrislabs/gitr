@@ -8,8 +8,10 @@
 //! mapping is the whole point of the module: the two views must not drift apart, or the
 //! same branch reads as two different things depending on where it is looked at.
 
-use gpui::{Hsla, IntoElement, ParentElement as _, Pixels, TextRun, Window, px, rgb};
-use gpui_component::{Sizable as _, ThemeColor, tag::Tag};
+use gpui::{
+    App, Hsla, IntoElement, ParentElement as _, Pixels, RenderOnce, TextRun, Window, px, rgb,
+};
+use gpui_component::{Selectable, Sizable as _, ThemeColor, tag::Tag};
 
 use domain::{BranchName, Reference};
 
@@ -173,13 +175,50 @@ pub fn overflow_label(hidden: usize) -> String {
 /// Deliberately in the muted foreground rather than in any of the four
 /// [`BadgeKind`] colours: it stands for a mixed set, and painting it green would claim the
 /// hidden references are local branches.
-pub fn render_overflow_badge(hidden: usize, theme: &ThemeColor) -> impl IntoElement {
-    let color = theme.muted_foreground;
+///
+/// A type of its own rather than a plain element because it is a popover trigger, and
+/// `Popover::trigger` takes `Selectable` — it wants to mark the trigger while the popover
+/// is open. Nothing here reads that flag: a badge has no selected appearance, and inventing
+/// one would make the strip's colours mean two different things at once.
+#[derive(IntoElement)]
+pub struct OverflowBadge {
+    hidden: usize,
+    color: Hsla,
+    selected: bool,
+}
 
-    Tag::custom(color.opacity(0.12), color, color.opacity(0.3))
+impl OverflowBadge {
+    pub fn new(hidden: usize, theme: &ThemeColor) -> Self {
+        Self {
+            hidden,
+            color: theme.muted_foreground,
+            selected: false,
+        }
+    }
+}
+
+impl Selectable for OverflowBadge {
+    fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        self.selected
+    }
+}
+
+impl RenderOnce for OverflowBadge {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        Tag::custom(
+            self.color.opacity(0.12),
+            self.color,
+            self.color.opacity(0.3),
+        )
         .rounded(px(BADGE_RADIUS))
         .xsmall()
-        .child(overflow_label(hidden))
+        .child(overflow_label(self.hidden))
+    }
 }
 
 /// One reference badge, as it sits inline before a subject.
