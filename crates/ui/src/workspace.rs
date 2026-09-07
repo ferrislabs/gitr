@@ -64,7 +64,7 @@ use crate::{
         ToggleDetailPanel, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme, ZoomWindow,
     },
     branch_actions::Deletion,
-    detail::DetailPanel,
+    detail::{CommitOwnership, DetailPanel},
     history::{HistoryPanel, HistoryPanelEvent},
     persistence,
     project::{
@@ -659,16 +659,22 @@ impl Workspace {
                 let history = repository.read(cx).history().clone();
                 let head = repository.read(cx).head().clone();
                 let deletion = deletion_context(repository, cx);
+                let ownership = commit_ownership(repository, cx);
                 self.history_panel.update(cx, |panel, cx| {
                     panel.set_history(history, cx);
                     panel.set_head(deletion, head_commit(&head), cx);
                 });
+                self.detail_panel
+                    .update(cx, |panel, cx| panel.set_ownership(ownership, cx));
                 cx.notify();
             }
             RepositoryEvent::SelectionChanged => {
                 let detail = repository.read(cx).detail().clone();
-                self.detail_panel
-                    .update(cx, |panel, cx| panel.set_detail(detail, window, cx));
+                let ownership = commit_ownership(repository, cx);
+                self.detail_panel.update(cx, |panel, cx| {
+                    panel.set_ownership(ownership, cx);
+                    panel.set_detail(detail, window, cx);
+                });
                 if repository.read(cx).selected().is_none() {
                     self.dismiss_detail(window, cx);
                 }
@@ -1306,11 +1312,34 @@ fn sync_panels_from_repository(
     let detail = repository.read(cx).detail().clone();
     let head = repository.read(cx).head().clone();
     let deletion = deletion_context(repository, cx);
+    let ownership = commit_ownership(repository, cx);
     history_panel.update(cx, |panel, cx| {
         panel.set_history(history, cx);
         panel.set_head(deletion, head_commit(&head), cx);
     });
-    detail_panel.update(cx, |panel, cx| panel.set_detail(detail, window, cx));
+    detail_panel.update(cx, |panel, cx| {
+        panel.set_ownership(ownership, cx);
+        panel.set_detail(detail, window, cx);
+    });
+}
+
+/// The branches the selected commit is named by in the detail panel, and the checked-out
+/// one that colours them.
+///
+/// Recomputed on a selection change and on a history change alike: the first picks another
+/// commit, the second moves the references under the one already selected — a commit that
+/// was a branch tip stops being one the moment a commit lands on top of it.
+fn commit_ownership(repository: &Entity<RepositoryState>, cx: &App) -> CommitOwnership {
+    let state = repository.read(cx);
+    let references = match (state.selected(), state.history().ready()) {
+        (Some(selected), Some(history)) => history.owning_references(selected),
+        _ => Vec::new(),
+    };
+
+    CommitOwnership {
+        references,
+        head_branch: head_branch(state.head()),
+    }
 }
 
 fn deletion_context(repository: &Entity<RepositoryState>, cx: &App) -> Deletion {

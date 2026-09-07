@@ -2,6 +2,11 @@
 //!
 //! A badge is coloured by [`BadgeKind`], not by the reference's identity, so every local
 //! branch reads the same way and a remote branch or tag never gets mistaken for one.
+//!
+//! Shared by the history table, where badges sit before a commit's subject, and by the
+//! detail panel, where the same badges name the branches a commit belongs to. The colour
+//! mapping is the whole point of the module: the two views must not drift apart, or the
+//! same branch reads as two different things depending on where it is looked at.
 
 use gpui::{Hsla, IntoElement, ParentElement as _, px, rgb};
 use gpui_component::{Sizable as _, ThemeColor, tag::Tag};
