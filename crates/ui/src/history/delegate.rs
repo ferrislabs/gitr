@@ -13,12 +13,13 @@ use gpui::{
     AnyElement, App, Bounds, Context, Div, InteractiveElement as _, IntoElement,
     ParentElement as _, PathBuilder, Pixels, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, fill, point,
-    prelude::FluentBuilder as _, px, relative, size,
+    prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{
     ActiveTheme as _, ThemeColor, h_flex,
     menu::ContextMenuExt as _,
     table::{Column, TableDelegate, TableState},
+    tooltip::Tooltip,
 };
 use graph::GraphRow;
 
@@ -38,7 +39,15 @@ const AUTHOR_COLUMN: usize = 3;
 const DATE_COLUMN: usize = 4;
 const COLUMN_COUNT: usize = 5;
 
+/// The share of the subject cell the badges may take before the rest is counted into a
+/// `+N`.
 const BADGE_STRIP_MAX_SHARE: f32 = 0.5;
+
+/// `gap_1` between badges, and `px_2` on each side of the subject cell — the two the strip
+/// has to budget around. Both are what the cell actually renders; a mismatch here shows up
+/// as a badge cropped by exactly the difference.
+const BADGE_GAP: Pixels = px(4.);
+const SUBJECT_CELL_PADDING: Pixels = px(8.);
 
 const SHA_COLUMN_WIDTH: Pixels = px(76.);
 const AUTHOR_COLUMN_WIDTH: Pixels = px(150.);
@@ -111,6 +120,12 @@ impl HistoryTableDelegate {
         }
         self.available_width = Some(width);
         true
+    }
+
+    /// How much of the subject cell the badge strip may fill before the rest becomes a
+    /// `+N`.
+    fn badge_budget(&self) -> Pixels {
+        (self.subject_width() - SUBJECT_CELL_PADDING * 2.) * BADGE_STRIP_MAX_SHARE
     }
 
     /// The width Subject renders at: everything the other four columns do not take.
@@ -258,7 +273,7 @@ impl TableDelegate for HistoryTableDelegate {
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let theme = cx.theme().colors;
@@ -284,6 +299,8 @@ impl TableDelegate for HistoryTableDelegate {
                 history.references_at(commit.id),
                 &self.deletion,
                 self.workspace.as_ref(),
+                self.badge_budget(),
+                window,
                 &theme,
             ),
             AUTHOR_COLUMN => author_cell(commit),
@@ -378,11 +395,14 @@ fn graph_cell(row: GraphRow, is_head: bool, theme: &ThemeColor) -> AnyElement {
     .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn subject_cell(
     commit: &CommitSummary,
     references: &[Reference],
     deletion: &Deletion,
     workspace: Option<&WeakEntity<Workspace>>,
+    budget: Pixels,
+    window: &Window,
     theme: &ThemeColor,
 ) -> AnyElement {
     h_flex()
@@ -393,33 +413,68 @@ fn subject_cell(
         .overflow_hidden()
         .when(!references.is_empty(), |cell| {
             cell.child(badge_strip(
-                commit.id, references, deletion, workspace, theme,
+                commit.id, references, deletion, workspace, budget, window, theme,
             ))
         })
         .child(div().truncate().child(commit.summary.clone()))
         .into_any_element()
 }
 
+/// The badges before a subject, and a `+N` for whatever did not fit.
+///
+/// A badge renders whole or not at all. The strip used to be a scroller clipped at half
+/// the cell, which put a branch name cut mid-word in front of the reader and asked them to
+/// discover that the fragment could be dragged. Counting the remainder instead says the
+/// same thing in one glyph and never lies about a name.
+///
+/// The count is measured against `budget` rather than left to the layout: gpui gives an
+/// element its bounds one phase *after* the children are built, so the choice of what to
+/// build cannot read them. The subject column's width is known here — the delegate
+/// computed it — so the strip predicts `Tag`'s own metrics through
+/// [`badges::measure_badge`] instead.
+#[allow(clippy::too_many_arguments)]
 fn badge_strip(
     commit: ObjectId,
     references: &[Reference],
     deletion: &Deletion,
     workspace: Option<&WeakEntity<Workspace>>,
+    budget: Pixels,
+    window: &Window,
     theme: &ThemeColor,
 ) -> AnyElement {
     let head_branch = deletion.head.as_ref();
+
+    let widths: Vec<Pixels> = references
+        .iter()
+        .map(|reference| badges::measure_badge(&reference.short_name(), window))
+        .collect();
+    let overflow = badges::measure_badge(&badges::overflow_label(references.len()), window);
+    let shown = badges::fitting_badge_count(&widths, budget, BADGE_GAP, overflow);
+    let hidden = references.len() - shown;
+
+    // What the counter stands for, so the names it hides stay reachable rather than
+    // merely gone.
+    let hidden_names = SharedString::from(
+        references
+            .iter()
+            .skip(shown)
+            .map(Reference::short_name)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
     let id = SharedString::from(format!("badges-{}", commit.to_hex_prefix(40)));
 
-    div()
+    h_flex()
         .id(id)
-        .max_w(relative(BADGE_STRIP_MAX_SHARE))
-        .overflow_x_scroll()
-        .restrict_scroll_to_axis()
-        .child(
-            h_flex()
-                .gap_1()
-                .flex_none()
-                .children(references.iter().enumerate().map(|(index, reference)| {
+        .gap_1()
+        .flex_none()
+        .children(
+            references
+                .iter()
+                .take(shown)
+                .enumerate()
+                .map(|(index, reference)| {
                     let badge = badges::render_badge(reference, head_branch, theme);
                     let cell = div().id(("branch-badge", index)).flex_none().child(badge);
                     match deletable_branch(reference, deletion, workspace) {
@@ -430,8 +485,17 @@ fn badge_strip(
                             .into_any_element(),
                         None => cell.into_any_element(),
                     }
-                })),
+                }),
         )
+        .when(hidden > 0, |strip| {
+            strip.child(
+                div()
+                    .id("branch-badge-overflow")
+                    .flex_none()
+                    .tooltip(move |window, cx| Tooltip::new(hidden_names.clone()).build(window, cx))
+                    .child(badges::render_overflow_badge(hidden, theme)),
+            )
+        })
         .into_any_element()
 }
 

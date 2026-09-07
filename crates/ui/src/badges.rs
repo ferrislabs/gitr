@@ -8,7 +8,7 @@
 //! mapping is the whole point of the module: the two views must not drift apart, or the
 //! same branch reads as two different things depending on where it is looked at.
 
-use gpui::{Hsla, IntoElement, ParentElement as _, px, rgb};
+use gpui::{Hsla, IntoElement, ParentElement as _, Pixels, TextRun, Window, px, rgb};
 use gpui_component::{Sizable as _, ThemeColor, tag::Tag};
 
 use domain::{BranchName, Reference};
@@ -31,6 +31,17 @@ const CURRENT_BRANCH: u32 = 0xe8622a;
 const TAG: u32 = 0xc9a227;
 
 const BADGE_RADIUS: f32 = 4.;
+
+/// [`Tag`]'s own metrics at `xsmall`, read off `gpui_component::tag`: `text_xs`,
+/// `px_1p5` on each side and `border_1` all round.
+///
+/// Duplicated here because measuring a badge means predicting what `Tag` will render, and
+/// `Tag` exposes no measurement of its own. Kept in rems rather than pixels for the two
+/// that are: `Tag` writes them as rem-based utilities, so they follow `Window::rem_size`
+/// and a hardcoded pixel count would quietly mismeasure at any other root size.
+const TAG_FONT_REMS: f32 = 0.75;
+const TAG_PADDING_REMS: f32 = 0.375;
+const TAG_BORDER: f32 = 1.;
 
 /// Which of the four badge colours a reference gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +73,88 @@ pub fn badge_color(kind: BadgeKind, theme: &ThemeColor) -> Hsla {
         BadgeKind::RemoteBranch => theme.blue,
         BadgeKind::Tag => rgb(TAG).into(),
     }
+}
+
+/// How wide the badge for `label` will render.
+///
+/// Shapes the text through the window's own text system rather than estimating from a
+/// character count: a branch name is proportional text, and `origin/dependabot/npm_and_yarn`
+/// is nowhere near thirty times the width of an `i`. The shaped line is cached by gpui, so
+/// asking once per badge per visible row is not a per-frame layout pass.
+pub fn measure_badge(label: &str, window: &Window) -> Pixels {
+    let rem = window.rem_size();
+    let font_size = rem * TAG_FONT_REMS;
+
+    let style = window.text_style();
+    let run = TextRun {
+        len: label.len(),
+        font: style.font(),
+        color: style.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+
+    let text = window
+        .text_system()
+        .layout_line(label, font_size, &[run], None)
+        .width;
+
+    text + rem * TAG_PADDING_REMS * 2. + px(TAG_BORDER * 2.)
+}
+
+/// How many of `widths` fit whole inside `budget`, the rest being counted into a single
+/// overflow badge of width `overflow`.
+///
+/// A badge either renders entirely or does not render at all — the point of the count is
+/// that no branch name is ever cut mid-word. `overflow` is reserved whenever anything is
+/// left over, and only then: a set that fits gets the whole budget.
+///
+/// Walks down from "everything fits" rather than up from nothing, because dropping a badge
+/// can *free* space — the last one to go takes the overflow reservation away with it — so
+/// the largest k that fits is not always reachable by adding badges one at a time.
+pub fn fitting_badge_count(
+    widths: &[Pixels],
+    budget: Pixels,
+    gap: Pixels,
+    overflow: Pixels,
+) -> usize {
+    for shown in (0..=widths.len()).rev() {
+        let mut needed: Pixels = widths[..shown].iter().copied().sum();
+        needed += gap * (shown.saturating_sub(1)) as f32;
+
+        if shown < widths.len() {
+            needed += overflow;
+            if shown > 0 {
+                needed += gap;
+            }
+        }
+
+        if needed <= budget {
+            return shown;
+        }
+    }
+
+    0
+}
+
+/// The label of the badge standing in for `hidden` references that did not fit.
+pub fn overflow_label(hidden: usize) -> String {
+    format!("+{hidden}")
+}
+
+/// The overflow badge — how many references the strip could not show whole.
+///
+/// Deliberately in the muted foreground rather than in any of the four
+/// [`BadgeKind`] colours: it stands for a mixed set, and painting it green would claim the
+/// hidden references are local branches.
+pub fn render_overflow_badge(hidden: usize, theme: &ThemeColor) -> impl IntoElement {
+    let color = theme.muted_foreground;
+
+    Tag::custom(color.opacity(0.12), color, color.opacity(0.3))
+        .rounded(px(BADGE_RADIUS))
+        .xsmall()
+        .child(overflow_label(hidden))
 }
 
 /// One reference badge, as it sits inline before a subject.
@@ -96,6 +189,65 @@ mod tests {
 
     fn tag() -> Reference {
         Reference::Tag(TagName::new("v1.0.0").unwrap())
+    }
+
+    fn widths(values: &[f32]) -> Vec<Pixels> {
+        values.iter().copied().map(px).collect()
+    }
+
+    #[test]
+    fn a_set_that_fits_shows_every_badge_and_no_counter() {
+        let shown = fitting_badge_count(&widths(&[100., 80.]), px(200.), px(4.), px(30.));
+        assert_eq!(shown, 2, "184 of a 200 budget: nothing overflows");
+    }
+
+    #[test]
+    fn a_badge_that_would_be_cropped_is_dropped_whole() {
+        let shown = fitting_badge_count(&widths(&[100., 80.]), px(150.), px(4.), px(30.));
+        assert_eq!(
+            shown, 1,
+            "the second badge needs 84 more and only 50 are left, so it goes entirely \
+             rather than being cut"
+        );
+    }
+
+    #[test]
+    fn the_last_badge_that_fits_still_loses_to_the_counter() {
+        assert_eq!(
+            fitting_badge_count(&widths(&[100., 80.]), px(130.), px(4.), px(30.)),
+            0,
+            "the first badge alone fits in 130, but not once the counter it forces is \
+             paid for — reserving the counter after the fact is exactly what crops it"
+        );
+    }
+
+    #[test]
+    fn a_set_that_exactly_fills_the_budget_needs_no_counter() {
+        assert_eq!(
+            fitting_badge_count(&widths(&[100., 80.]), px(184.), px(4.), px(30.)),
+            2,
+            "100 + 4 + 80 is the budget to the pixel, and nothing overflows, so no room \
+             is reserved for a counter that would not be drawn"
+        );
+    }
+
+    #[test]
+    fn a_budget_too_small_for_anything_shows_the_counter_alone() {
+        assert_eq!(
+            fitting_badge_count(&widths(&[300.]), px(60.), px(4.), px(30.)),
+            0
+        );
+    }
+
+    #[test]
+    fn no_references_need_no_room() {
+        assert_eq!(fitting_badge_count(&[], px(0.), px(4.), px(30.)), 0);
+    }
+
+    #[test]
+    fn the_overflow_label_counts_what_is_hidden_not_what_is_shown() {
+        assert_eq!(overflow_label(1), "+1");
+        assert_eq!(overflow_label(12), "+12");
     }
 
     #[test]
