@@ -113,6 +113,13 @@ pub fn measure_badge(label: &str, window: &Window) -> Pixels {
 /// Walks down from "everything fits" rather than up from nothing, because dropping a badge
 /// can *free* space — the last one to go takes the overflow reservation away with it — so
 /// the largest k that fits is not always reachable by adding badges one at a time.
+///
+/// **A counter is never drawn for a single reference.** A `+1` occupies most of the width
+/// of the thing it replaces and says strictly less than it: the reader learns that a
+/// branch exists and not which one. Where exactly one would be left over, the reference
+/// itself is shown instead and `budget` is allowed to overrun — the subject beside it
+/// truncates, which is the ordinary thing for a subject to do. The budget is half the
+/// cell, so the overrun still lands inside it.
 pub fn fitting_badge_count(
     widths: &[Pixels],
     budget: Pixels,
@@ -131,11 +138,17 @@ pub fn fitting_badge_count(
         }
 
         if needed <= budget {
-            return shown;
+            return if widths.len() - shown == 1 {
+                widths.len()
+            } else {
+                shown
+            };
         }
     }
 
-    0
+    // Nothing fits at all, so `shown` is zero — and with a single reference that would be
+    // a counter standing alone for it, which is the one thing this must never draw.
+    if widths.len() == 1 { 1 } else { 0 }
 }
 
 /// The label of the badge standing in for `hidden` references that did not fit.
@@ -203,7 +216,7 @@ mod tests {
 
     #[test]
     fn a_badge_that_would_be_cropped_is_dropped_whole() {
-        let shown = fitting_badge_count(&widths(&[100., 80.]), px(150.), px(4.), px(30.));
+        let shown = fitting_badge_count(&widths(&[100., 80., 80.]), px(150.), px(4.), px(30.));
         assert_eq!(
             shown, 1,
             "the second badge needs 84 more and only 50 are left, so it goes entirely \
@@ -212,9 +225,29 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_leftover_is_shown_rather_than_counted() {
+        assert_eq!(
+            fitting_badge_count(&widths(&[100., 80.]), px(150.), px(4.), px(30.)),
+            2,
+            "the second badge does not fit, but a `+1` in its place costs nearly as much \
+             and names nothing — so it overruns the budget instead"
+        );
+    }
+
+    #[test]
+    fn a_single_reference_too_wide_for_the_budget_is_still_shown() {
+        assert_eq!(
+            fitting_badge_count(&widths(&[300.]), px(60.), px(4.), px(30.)),
+            1,
+            "a row whose only badge is replaced by `+1` has lost the branch name and \
+             gained nothing — this is the case the counter must never take"
+        );
+    }
+
+    #[test]
     fn the_last_badge_that_fits_still_loses_to_the_counter() {
         assert_eq!(
-            fitting_badge_count(&widths(&[100., 80.]), px(130.), px(4.), px(30.)),
+            fitting_badge_count(&widths(&[100., 80., 80.]), px(130.), px(4.), px(30.)),
             0,
             "the first badge alone fits in 130, but not once the counter it forces is \
              paid for — reserving the counter after the fact is exactly what crops it"
@@ -234,7 +267,7 @@ mod tests {
     #[test]
     fn a_budget_too_small_for_anything_shows_the_counter_alone() {
         assert_eq!(
-            fitting_badge_count(&widths(&[300.]), px(60.), px(4.), px(30.)),
+            fitting_badge_count(&widths(&[300., 300., 300.]), px(60.), px(4.), px(30.)),
             0
         );
     }
